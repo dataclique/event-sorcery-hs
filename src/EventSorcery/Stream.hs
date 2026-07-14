@@ -11,6 +11,7 @@ module EventSorcery.Stream (
   StreamVersion (..),
   replay,
   streamKey,
+  streamKeyParts,
 ) where
 
 import EventSorcery.Aggregate
@@ -88,13 +89,18 @@ streamKey identifier =
     (encodeEntityId identifier)
 
 
+streamKeyParts :: StreamKey entity -> (Text, Text)
+streamKeyParts (StreamKey aggregateName identifier) = (aggregateName, identifier)
+
+
 replay
   :: forall entity
    . EventSourced entity
   => StreamKey entity
   -> [StoredEvent]
   -> Either (ReplayError entity) (Maybe entity)
-replay key events = fst <$> foldM (replayEvent key) (Nothing, StreamPosition 1) events
+replay key events =
+  fst <$> foldM (replayEvent key) (Nothing, StreamPosition 1) events
 
 
 replayEvent

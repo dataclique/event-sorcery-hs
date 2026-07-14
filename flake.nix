@@ -20,7 +20,11 @@
       system:
       let
         pkgs = import nixpkgs { inherit system; };
-        haskellPackages = pkgs.haskellPackages;
+        haskellPackages = pkgs.haskell.packages.ghc914.override {
+          overrides = _self: super: {
+            protolude = pkgs.haskell.lib.doJailbreak super.protolude;
+          };
+        };
 
         package = haskellPackages.callCabal2nix "event-sorcery" self { };
 
@@ -41,18 +45,18 @@
           formatting = hooks;
         };
 
-        devShells.default = haskellPackages.shellFor {
-          packages = _: [ package ];
-          nativeBuildInputs = [
-            haskellPackages.cabal-install
-            haskellPackages.fourmolu
-            haskellPackages.haskell-language-server
-            haskellPackages.hlint
-            haskellPackages.cabal-fmt
+        devShells.default = pkgs.mkShell {
+          packages = [
+            haskellPackages.ghc
+            pkgs.cabal-install
+            pkgs.fourmolu
+            pkgs.hlint
+            pkgs.haskellPackages.cabal-fmt
+            pkgs.stack
             pkgs.nixfmt
             pkgs.sqlite
           ];
-          inherit (hooks) shellHook;
+          shellHook = hooks.shellHook;
         };
 
         formatter = pkgs.nixfmt;

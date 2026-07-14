@@ -11,13 +11,27 @@ The public API is currently under construction. Its architecture is recorded in
 
 ## Development
 
-The project is managed entirely through Nix:
+The project is managed entirely through Nix. With nix-direnv:
+
+```console
+direnv allow
+stack test
+```
+
+Alternatively, enter the development shell manually:
 
 ```console
 nix develop
+stack test
+```
+
+Run the complete CI-equivalent gate from either environment:
+
+```console
 nix flake check
 ```
 
-The development shell provides GHC, Cabal, Haskell Language Server, Fourmolu,
-HLint, and SQLite. `nix flake check` builds the library and runs every formatting,
-lint, and test gate.
+Direnv loads the flake automatically. The development shell provides GHC 9.14.1,
+Stack, Cabal, Fourmolu, HLint, and SQLite. Stack uses the Nix-provided compiler
+rather than installing its own. `nix flake check` builds the library and runs
+every formatting, lint, and test gate.
