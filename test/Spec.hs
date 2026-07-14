@@ -1,5 +1,6 @@
 module Main (main) where
 
+import Conduit (runConduit, sinkList, (.|))
 import Data.Aeson qualified as Aeson
 import Data.ByteString.Lazy qualified as LazyByteString
 import EventSorcery
@@ -119,6 +120,8 @@ main = hspec do
 
   eventStoreContract "in-memory event store" withMemoryStore
   eventStoreContract "SQLite event store" withSQLiteStore
+  projectionStoreContract "in-memory projection store" withMemoryStore
+  projectionStoreContract "SQLite projection store" withSQLiteStore
 
 
 eventStoreContract
@@ -131,6 +134,16 @@ eventStoreContract
   -> (forall result. (backend -> IO result) -> IO result)
   -> Spec
 eventStoreContract label withStore = describe label do
+  it "streams committed events from a durable global cursor" $ withStore \store -> do
+    batch <- validBatch (appendEvents accountKey NoStream (Opened 10 :| []))
+    commit store batch `shouldReturn` Right ()
+    streamed <-
+      runExceptT
+        (runConduit (streamEventsAfter store (EventOffset 0) .| sinkList))
+    streamed
+      `shouldBe` Right
+        [StoredEnvelope (EventOffset 1) accountIdentity (stored 1 (Opened 10))]
+
   it "appends and loads an ordered stream" $ withStore \store -> do
     batch <- validBatch (appendEvents accountKey NoStream (Opened 10 :| []))
     commit store batch `shouldReturn` Right ()
@@ -187,6 +200,50 @@ eventStoreContract label withStore = describe label do
       fmap length loaded `shouldBe` Right 1
 
 
+projectionStoreContract
+  :: forall backend
+   . ( Eq (BackendError backend)
+     , ProjectionStore backend
+     , Show (BackendError backend)
+     )
+  => [Char]
+  -> (forall result. (backend -> IO result) -> IO result)
+  -> Spec
+projectionStoreContract label withStore = describe label do
+  it "stores a view and its checkpoint in one advance" $ withStore \store -> do
+    advanceProjection store firstProjectionUpdate
+      `shouldReturn` Right ProjectionAdvanced
+    loadProjection store balancesProjectionName
+      `shouldReturn` Right
+        (Just (ProjectionState (EventOffset 1) "view-at-one"))
+
+  it "absorbs a repeated current envelope without replacing the view" $
+    withStore \store -> do
+      advanceProjection store firstProjectionUpdate
+        `shouldReturn` Right ProjectionAdvanced
+      advanceProjection store repeatedProjectionUpdate
+        `shouldReturn` Right ProjectionAlreadyApplied
+      loadProjection store balancesProjectionName
+        `shouldReturn` Right
+          (Just (ProjectionState (EventOffset 1) "view-at-one"))
+
+  it "rejects a skipped envelope without storing its view" $ withStore \store -> do
+    advanceProjection store skippedProjectionUpdate
+      `shouldReturn` Left
+        ( ProjectionSequenceMismatch
+            balancesProjectionName
+            (EventOffset 1)
+            (EventOffset 2)
+        )
+    loadProjection store balancesProjectionName `shouldReturn` Right Nothing
+
+  it "resets rebuildable projection state" $ withStore \store -> do
+    advanceProjection store firstProjectionUpdate
+      `shouldReturn` Right ProjectionAdvanced
+    resetProjection store balancesProjectionName `shouldReturn` Right ()
+    loadProjection store balancesProjectionName `shouldReturn` Right Nothing
+
+
 withMemoryStore :: (MemoryStore -> IO result) -> IO result
 withMemoryStore action = newMemoryStore >>= action
 
@@ -210,6 +267,26 @@ testLimits =
   mkCommitLimits
     (payloadLimit 1024)
     (batchLimit 16)
+
+
+balancesProjectionName :: ProjectionName
+balancesProjectionName =
+  fromMaybe (panic "invalid projection name") (mkProjectionName "balances")
+
+
+firstProjectionUpdate :: ProjectionUpdate
+firstProjectionUpdate =
+  projectionUpdate balancesProjectionName (EventOffset 1) "view-at-one"
+
+
+repeatedProjectionUpdate :: ProjectionUpdate
+repeatedProjectionUpdate =
+  projectionUpdate balancesProjectionName (EventOffset 1) "replacement"
+
+
+skippedProjectionUpdate :: ProjectionUpdate
+skippedProjectionUpdate =
+  projectionUpdate balancesProjectionName (EventOffset 2) "view-at-two"
 
 
 payloadLimit :: Word64 -> PayloadLimit

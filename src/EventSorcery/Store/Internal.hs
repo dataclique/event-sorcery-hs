@@ -4,11 +4,13 @@ module EventSorcery.Store.Internal (
   CommitError (..),
   CommitLimitViolation (..),
   CommitLimits (..),
+  EventOffset (..),
   EventStore (..),
   PayloadLimit (..),
   ProposedEvent (..),
   StreamAppend (..),
   StreamIdentity (..),
+  StoredEnvelope (..),
   Unrestricted (..),
   appendEvents,
   commitBatch,
@@ -20,6 +22,7 @@ module EventSorcery.Store.Internal (
   streamAppendIdentity,
 ) where
 
+import Conduit (ConduitT)
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Set qualified as Set
@@ -42,6 +45,14 @@ data CommitLimits = CommitLimits PayloadLimit BatchLimit
 
 data StreamIdentity = StreamIdentity Text Text
   deriving stock (Eq, Ord, Show)
+
+
+newtype EventOffset = EventOffset Word64
+  deriving stock (Eq, Ord, Show)
+
+
+data StoredEnvelope = StoredEnvelope EventOffset StreamIdentity StoredEvent
+  deriving stock (Eq, Show)
 
 
 data ProposedEvent = ProposedEvent EventMetadata ByteString
@@ -87,6 +98,15 @@ class EventStore backend where
     :: backend
     -> StreamIdentity
     -> IO (Either (BackendError backend) [StoredEvent])
+  streamEventsAfter
+    :: backend
+    -> EventOffset
+    -> ConduitT
+         ()
+         StoredEnvelope
+         (ExceptT (BackendError backend) IO)
+         ()
+  streamEventsAfter _ _ = pure ()
   commit :: backend -> CommitBatch %1 -> IO (Either (CommitError backend) ())
 
 

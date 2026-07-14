@@ -53,14 +53,19 @@ library
     EventSorcery.Aggregate
     EventSorcery.Backend.Memory
     EventSorcery.Backend.SQLite
+    EventSorcery.Projection
     EventSorcery.Store
     EventSorcery.Stream
 
-  other-modules:   EventSorcery.Store.Internal
+  other-modules:
+    EventSorcery.Projection.Internal
+    EventSorcery.Store.Internal
+
   hs-source-dirs:  src
   build-depends:
     , base           >=4.18  && <5
     , bytestring     >=0.11  && <0.13
+    , conduit        >=1.3.6 && <1.4
     , containers     >=0.6   && <0.9
     , protolude      >=0.3.4 && <0.4
     , sqlite-simple  >=0.4   && <0.5
@@ -76,6 +81,7 @@ test-suite event-sorcery-test
     , aeson          >=2.2   && <2.3
     , base           >=4.18  && <5
     , bytestring     >=0.11  && <0.13
+    , conduit        >=1.3.6 && <1.4
     , event-sorcery
     , hspec          >=2.11  && <2.12
     , protolude      >=0.3.4 && <0.4

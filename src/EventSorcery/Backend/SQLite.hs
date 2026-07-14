@@ -6,6 +6,7 @@ module EventSorcery.Backend.SQLite (
   openSQLiteStore,
 ) where
 
+import Conduit qualified
 import Data.List.NonEmpty qualified as NonEmpty
 import Database.SQLite.Simple (
   Connection,
@@ -21,6 +22,7 @@ import Database.SQLite.Simple (
  )
 import Database.SQLite.Simple.FromRow (FromRow (..), field)
 import EventSorcery.Aggregate (EventVersion (..))
+import EventSorcery.Projection.Internal
 import EventSorcery.Store.Internal
 import EventSorcery.Stream
 import Protolude
@@ -45,8 +47,38 @@ data SQLiteFailure
 data EventRow = EventRow Word64 Text Word16 ByteString
 
 
+data EnvelopeRow
+  = EnvelopeRow
+      Word64
+      Text
+      Text
+      Word64
+      Text
+      Word16
+      ByteString
+
+
+data ProjectionRow = ProjectionRow Word64 ByteString
+
+
 instance FromRow EventRow where
   fromRow = EventRow <$> field <*> field <*> field <*> field
+
+
+instance FromRow EnvelopeRow where
+  fromRow =
+    EnvelopeRow
+      <$> field
+      <*> field
+      <*> field
+      <*> field
+      <*> field
+      <*> field
+      <*> field
+
+
+instance FromRow ProjectionRow where
+  fromRow = ProjectionRow <$> field <*> field
 
 
 openSQLiteStore :: FilePath -> IO (Either SQLiteError SQLiteStore)
@@ -76,7 +108,37 @@ instance EventStore SQLiteStore where
     pure (first SQLiteReadFailed loaded)
 
 
+  streamEventsAfter (SQLiteStore connection) = streamRows connection
+
+
   commit = commitSQLite
+
+
+instance ProjectionStore SQLiteStore where
+  loadProjection (SQLiteStore connection) name = do
+    loaded <- try @SQLError (loadProjectionState connection name)
+    pure (first (const SQLiteReadFailed) loaded)
+
+
+  advanceProjection (SQLiteStore connection) update =
+    case consumeProjectionUpdate update of
+      Unrestricted (name, offset, view) -> do
+        advanced <-
+          try @SQLError
+            ( withTransaction
+                connection
+                (advanceProjectionTransaction connection name offset view)
+            )
+        pure case advanced of
+          Left _ -> Left (ProjectionBackendFailed SQLiteCommitFailed)
+          Right result -> result
+
+
+  resetProjection (SQLiteStore connection) (ProjectionName name) = do
+    reset <-
+      try @SQLError
+        (execute connection "DELETE FROM projections WHERE name = ?" (Only name))
+    pure (first (const SQLiteCommitFailed) reset)
 
 
 commitSQLite
@@ -126,18 +188,28 @@ initializeConnection connection = do
 
 
 migrate :: Connection -> IO ()
-migrate connection =
+migrate connection = do
   execute_
     connection
     """
     CREATE TABLE IF NOT EXISTS events (
+      global_offset INTEGER PRIMARY KEY AUTOINCREMENT,
       aggregate_type TEXT NOT NULL,
       aggregate_id TEXT NOT NULL,
       sequence INTEGER NOT NULL,
       event_type TEXT NOT NULL,
       event_version INTEGER NOT NULL,
       payload BLOB NOT NULL,
-      PRIMARY KEY (aggregate_type, aggregate_id, sequence)
+      UNIQUE (aggregate_type, aggregate_id, sequence)
+    )
+    """
+  execute_
+    connection
+    """
+    CREATE TABLE IF NOT EXISTS projections (
+      name TEXT PRIMARY KEY,
+      event_offset INTEGER NOT NULL,
+      view BLOB NOT NULL
     )
     """
 
@@ -161,6 +233,123 @@ loadRows connection (StreamIdentity aggregateName identifier) = do
         (StreamPosition position)
         (EventMetadata aggregateName identifier eventName (EventVersion version))
         payload
+
+
+streamRows
+  :: Connection
+  -> EventOffset
+  -> Conduit.ConduitT
+       ()
+       StoredEnvelope
+       (ExceptT SQLiteError IO)
+       ()
+streamRows connection offset = do
+  loaded <- liftIO (try @SQLError (loadEnvelopeRows connection offset))
+  rows <- either (const (throwError SQLiteReadFailed)) pure loaded
+  case NonEmpty.nonEmpty rows of
+    Nothing -> pure ()
+    Just page -> do
+      let envelopes = toEnvelope <$> page
+      Conduit.yieldMany (NonEmpty.toList envelopes)
+      streamRows connection (envelopeOffset (NonEmpty.last envelopes))
+
+
+loadEnvelopeRows :: Connection -> EventOffset -> IO [EnvelopeRow]
+loadEnvelopeRows connection (EventOffset offset) =
+  query
+    connection
+    """
+    SELECT
+      global_offset,
+      aggregate_type,
+      aggregate_id,
+      sequence,
+      event_type,
+      event_version,
+      payload
+    FROM events
+    WHERE global_offset > ?
+    ORDER BY global_offset
+    LIMIT ?
+    """
+    (offset, projectionPageSize)
+
+
+projectionPageSize :: Word16
+projectionPageSize = 256
+
+
+toEnvelope :: EnvelopeRow -> StoredEnvelope
+toEnvelope
+  (EnvelopeRow offset aggregateName identifier position eventName version payload) =
+    StoredEnvelope
+      (EventOffset offset)
+      (StreamIdentity aggregateName identifier)
+      ( StoredEvent
+          (StreamPosition position)
+          ( EventMetadata
+              aggregateName
+              identifier
+              eventName
+              (EventVersion version)
+          )
+          payload
+      )
+
+
+envelopeOffset :: StoredEnvelope -> EventOffset
+envelopeOffset (StoredEnvelope offset _ _) = offset
+
+
+loadProjectionState
+  :: Connection -> ProjectionName -> IO (Maybe ProjectionState)
+loadProjectionState connection (ProjectionName name) = do
+  rows <-
+    query
+      connection
+      """
+      SELECT event_offset, view
+      FROM projections
+      WHERE name = ?
+      """
+      (Only name)
+  pure case rows of
+    ProjectionRow offset view : _ ->
+      Just (ProjectionState (EventOffset offset) view)
+    [] -> Nothing
+
+
+advanceProjectionTransaction
+  :: Connection
+  -> ProjectionName
+  -> EventOffset
+  -> ByteString
+  -> IO (Either (ProjectionError SQLiteStore) ProjectionAdvance)
+advanceProjectionTransaction connection name offset view = do
+  current <- loadProjectionState connection name
+  case decideProjectionAdvance name offset view current of
+    Left failure -> pure (Left failure)
+    Right (advance, next) -> do
+      traverse_ (storeProjectionState connection name) next
+      pure (Right advance)
+
+
+storeProjectionState
+  :: Connection -> ProjectionName -> ProjectionState -> IO ()
+storeProjectionState
+  connection
+  (ProjectionName name)
+  (ProjectionState (EventOffset offset) view) =
+    execute
+      connection
+      """
+      INSERT INTO projections (name, event_offset, view)
+      VALUES (?, ?, ?)
+      ON CONFLICT (name) DO UPDATE SET
+        event_offset = excluded.event_offset,
+        view = excluded.view
+      """
+      (name, offset, view)
 
 
 commitTransaction
