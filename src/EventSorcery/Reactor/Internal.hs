@@ -1,9 +1,12 @@
 module EventSorcery.Reactor.Internal (
   OutboxEntry (..),
   OutboxPayload (..),
+  Reactor (..),
   ReactorCommit (..),
+  ReactorContext (..),
   ReactorError (..),
   ReactorName (..),
+  ReactorRunError (..),
   ReactorStore (..),
   ReactorUpdate (..),
   consumeReactorUpdate,
@@ -11,13 +14,29 @@ module EventSorcery.Reactor.Internal (
   outboxDeliveryId,
 ) where
 
+import EventSorcery.Aggregate
 import EventSorcery.Delivery.Internal
 import EventSorcery.Store.Internal
+import EventSorcery.Stream
 import Protolude
 
 
 newtype ReactorName = ReactorName Text
   deriving stock (Eq, Ord, Show)
+
+
+data Reactor entity reactorError
+  = Reactor
+      ReactorName
+      (ReactorContext -> Event entity -> Either reactorError (Maybe OutboxEntry))
+
+
+data ReactorContext
+  = ReactorContext
+      EventOffset
+      StreamIdentity
+      StreamPosition
+  deriving stock (Eq, Show)
 
 
 data OutboxPayload
@@ -47,6 +66,36 @@ data ReactorError backend
   | ReactorOffsetExhausted ReactorName EventOffset
   | ReactorDeliveryMismatch DeliveryId
   | ReactorBackendFailed (BackendError backend)
+
+
+data ReactorRunError backend reactorError
+  = ReactorEnvelopeDecodeFailed
+      ReactorName
+      EventOffset
+      StreamPosition
+      DecodeCause
+  | ReactorEnvelopeMetadataMismatch
+      ReactorName
+      EventOffset
+      StreamPosition
+      MetadataMismatch
+  | ReactorReactionFailed
+      ReactorName
+      EventOffset
+      StreamPosition
+      reactorError
+  | ReactorCheckpointFailed (ReactorError backend)
+  | ReactorReadFailed (BackendError backend)
+
+
+deriving stock instance
+  (Eq (BackendError backend), Eq reactorError)
+  => Eq (ReactorRunError backend reactorError)
+
+
+deriving stock instance
+  (Show (BackendError backend), Show reactorError)
+  => Show (ReactorRunError backend reactorError)
 
 
 deriving stock instance

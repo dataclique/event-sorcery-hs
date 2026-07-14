@@ -64,6 +64,10 @@ data BalanceProjectionError = BalanceProjectionError
   deriving stock (Eq, Show)
 
 
+data BalanceReactorError = BalanceReactorError
+  deriving stock (Eq, Show)
+
+
 newtype EmailJob = EmailJob Text
 
 
@@ -276,6 +280,8 @@ main = hspec do
   jobRuntimeContract "SQLite job runtime" withSQLiteStore
   reactorStoreContract "in-memory reactor store" withMemoryStore
   reactorStoreContract "SQLite reactor store" withSQLiteStore
+  reactorRunnerContract "in-memory reactor runner" withMemoryStore
+  reactorRunnerContract "SQLite reactor runner" withSQLiteStore
   schemaStoreContract "in-memory schema store" withMemoryStore
   schemaStoreContract "SQLite schema store" withSQLiteStore
   storeContract "in-memory typed store" withMemoryStore
@@ -763,6 +769,30 @@ reactorStoreContract label withStore = describe label do
         `shouldReturn` Right (Just firstOutboxEntry)
 
 
+reactorRunnerContract
+  :: forall backend
+   . ( Eq (BackendError backend)
+     , ReactorStore backend
+     , Show (BackendError backend)
+     )
+  => [Char]
+  -> (forall result. (backend -> IO result) -> IO result)
+  -> Spec
+reactorRunnerContract label withStore = describe label do
+  it "catches up once and resumes from its durable checkpoint" $
+    withStore \store -> do
+      initial <-
+        validBatch
+          (appendEvents accountKey NoStream (Opened 10 :| [Deposited 5]))
+      commit store initial `shouldReturn` Right ()
+      catchUpReactor store balanceReactor
+        `shouldReturn` Right (EventOffset 2)
+      loadOutboxEntry store deliveryId
+        `shouldReturn` Right (Just firstOutboxEntry)
+      catchUpReactor store balanceReactor
+        `shouldReturn` Right (EventOffset 2)
+
+
 storeContract
   :: forall backend
    . ( Eq (BackendError backend)
@@ -1022,6 +1052,15 @@ secondDeliveryId =
 accountReactorName :: ReactorName
 accountReactorName =
   fromMaybe (panic "invalid reactor name") (mkReactorName "accounts")
+
+
+balanceReactor :: Reactor Account BalanceReactorError
+balanceReactor = Reactor accountReactorName react
+  where
+    react _ event = Right case event of
+      Deposited _ -> Just firstOutboxEntry
+      Opened _ -> Nothing
+      NotificationQueued _ -> Nothing
 
 
 secondReactorName :: ReactorName
