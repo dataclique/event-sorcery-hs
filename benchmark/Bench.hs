@@ -43,6 +43,12 @@ newtype SQLiteFixture = SQLiteFixture SQLiteStore
 data SQLiteCommitFixture = SQLiteCommitFixture SQLiteStore CommitBatch
 
 
+data MemoryJobFixture = MemoryJobFixture MemoryStore [LeaseWindow]
+
+
+data SQLiteJobFixture = SQLiteJobFixture SQLiteStore [LeaseWindow]
+
+
 instance NFData MemoryFixture where
   rnf (MemoryFixture store) = store `seq` ()
 
@@ -53,6 +59,14 @@ instance NFData SQLiteFixture where
 
 instance NFData SQLiteCommitFixture where
   rnf (SQLiteCommitFixture store batch) = store `seq` batch `seq` ()
+
+
+instance NFData MemoryJobFixture where
+  rnf (MemoryJobFixture store windows) = store `seq` rnf windows
+
+
+instance NFData SQLiteJobFixture where
+  rnf (SQLiteJobFixture store windows) = store `seq` rnf windows
 
 
 instance EventSourced Account where
@@ -110,6 +124,16 @@ main = do
               setupSQLiteCommitFixture
               closeSQLiteCommitFixture
               commitSQLiteFixture
+        ]
+    , bgroup
+        "jobs"
+        [ bench "memory/1000 lease claims" $
+            perRunEnv setupMemoryJobFixture claimMemoryJob
+        , bench "sqlite/1000 lease claims" $
+            perRunEnvWithCleanup
+              setupSQLiteJobFixture
+              closeSQLiteJobFixture
+              claimSQLiteJob
         ]
     ]
 
@@ -175,8 +199,26 @@ setupSQLiteCommitFixture = do
   pure (SQLiteCommitFixture store batch)
 
 
+setupMemoryJobFixture :: IO MemoryJobFixture
+setupMemoryJobFixture = do
+  store <- newMemoryStore
+  enqueueJob store benchmarkJobId "payload" >>= requireJobEnqueued
+  pure (MemoryJobFixture store benchmarkLeaseWindows)
+
+
+setupSQLiteJobFixture :: IO SQLiteJobFixture
+setupSQLiteJobFixture = do
+  store <- openBenchmarkSQLite
+  enqueueJob store benchmarkJobId "payload" >>= requireJobEnqueued
+  pure (SQLiteJobFixture store benchmarkLeaseWindows)
+
+
 closeSQLiteCommitFixture :: SQLiteCommitFixture -> IO ()
 closeSQLiteCommitFixture (SQLiteCommitFixture store _) = closeSQLiteStore store
+
+
+closeSQLiteJobFixture :: SQLiteJobFixture -> IO ()
+closeSQLiteJobFixture (SQLiteJobFixture store _) = closeSQLiteStore store
 
 
 consumeMemory :: MemoryFixture -> IO Word64
@@ -221,6 +263,36 @@ commitSQLiteFixture (SQLiteCommitFixture store batch) = do
   either (panic . show) (const (pure 1)) committed
 
 
+claimMemoryJob :: MemoryJobFixture -> IO Word64
+claimMemoryJob (MemoryJobFixture store windows) =
+  claimJobs store windows
+
+
+claimSQLiteJob :: SQLiteJobFixture -> IO Word64
+claimSQLiteJob (SQLiteJobFixture store windows) =
+  claimJobs store windows
+
+
+claimJobs
+  :: (JobStore backend, Show (BackendError backend))
+  => backend
+  -> [LeaseWindow]
+  -> IO Word64
+claimJobs store = foldM claim 0
+  where
+    claim _ window = do
+      result <- claimJob store benchmarkJobId window
+      case result of
+        Right
+          ( JobClaim
+              (LeaseToken token)
+              (AttemptCount attempts)
+              payload
+            ) ->
+            ByteString.length payload `seq` token `seq` pure attempts
+        other -> panic (show other)
+
+
 benchmarkBatch :: Word64 -> IO CommitBatch
 benchmarkBatch count =
   either
@@ -245,6 +317,15 @@ requireRight :: Show error => Either error () -> IO ()
 requireRight = either (panic . show) pure
 
 
+requireJobEnqueued
+  :: Show (BackendError backend)
+  => Either (JobError backend) JobEnqueue
+  -> IO ()
+requireJobEnqueued result = case result of
+  Right JobEnqueued -> pure ()
+  other -> panic (show other)
+
+
 openBenchmarkSQLite :: IO SQLiteStore
 openBenchmarkSQLite =
   openSQLiteStore ":memory:" >>= either (panic . show) pure
@@ -260,6 +341,23 @@ benchmarkLimits =
 projectionName :: ProjectionName
 projectionName =
   fromMaybe (panic "invalid projection name") (mkProjectionName "benchmark")
+
+
+benchmarkJobId :: JobId
+benchmarkJobId =
+  fromMaybe (panic "invalid benchmark job id") (mkJobId "benchmark-job")
+
+
+benchmarkLeaseWindows :: [LeaseWindow]
+benchmarkLeaseWindows = leaseWindow <$> [0 .. 999]
+  where
+    leaseWindow claimedAt =
+      fromMaybe
+        (panic "invalid benchmark lease window")
+        ( mkLeaseWindow
+            (LeaseInstant claimedAt)
+            (LeaseInstant (claimedAt + 1))
+        )
 
 
 accountKey :: StreamKey Account
