@@ -3,6 +3,7 @@ module EventSorcery.Projection.Internal (
   ProjectionAdvance (..),
   ProjectionError (..),
   ProjectionName (..),
+  ProjectionRunError (..),
   ProjectionState (..),
   ProjectionStore (..),
   ProjectionUpdate (..),
@@ -12,6 +13,7 @@ module EventSorcery.Projection.Internal (
 
 import EventSorcery.Aggregate
 import EventSorcery.Store.Internal
+import EventSorcery.Stream
 import Protolude
 
 
@@ -56,6 +58,37 @@ deriving stock instance
 
 deriving stock instance
   Show (BackendError backend) => Show (ProjectionError backend)
+
+
+data ProjectionRunError backend projectionError
+  = ProjectionViewDecodeFailed ProjectionName DecodeCause
+  | ProjectionEnvelopeDecodeFailed
+      ProjectionName
+      EventOffset
+      StreamPosition
+      DecodeCause
+  | ProjectionEnvelopeMetadataMismatch
+      ProjectionName
+      EventOffset
+      StreamPosition
+      MetadataMismatch
+  | ProjectionApplyFailed
+      ProjectionName
+      EventOffset
+      StreamPosition
+      projectionError
+  | ProjectionCheckpointFailed (ProjectionError backend)
+  | ProjectionReadFailed (BackendError backend)
+
+
+deriving stock instance
+  (Eq (BackendError backend), Eq projectionError)
+  => Eq (ProjectionRunError backend projectionError)
+
+
+deriving stock instance
+  (Show (BackendError backend), Show projectionError)
+  => Show (ProjectionRunError backend projectionError)
 
 
 class EventStore backend => ProjectionStore backend where

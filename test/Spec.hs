@@ -43,6 +43,15 @@ data AccountApplyError = DepositBeforeOpen
   deriving stock (Eq, Show)
 
 
+newtype BalanceView = BalanceView Word64
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (Aeson.FromJSON, Aeson.ToJSON)
+
+
+data BalanceProjectionError = BalanceProjectionError
+  deriving stock (Eq, Show)
+
+
 newtype EmailJob = EmailJob Text
 
 
@@ -279,6 +288,60 @@ projectionStoreContract label withStore = describe label do
     resetProjection store balancesProjectionName `shouldReturn` Right ()
     loadProjection store balancesProjectionName `shouldReturn` Right Nothing
 
+  it "catches up incrementally and rebuilds from the global event log" $
+    withStore \store -> do
+      initial <-
+        validBatchFrom
+          ( appendEvents accountKey NoStream (Opened 10 :| [])
+              :| [appendEvents secondAccountKey NoStream (Opened 20 :| [])]
+          )
+      commit store initial `shouldReturn` Right ()
+      catchUpProjection store balanceProjection
+        `shouldReturn` Right (BalanceView 30)
+      loaded <- loadProjection store balancesProjectionName
+      fmap (fmap projectionCheckpoint) loaded
+        `shouldBe` Right (Just (EventOffset 2))
+      deposit <-
+        validBatch
+          ( appendEvents
+              accountKey
+              (At (StreamVersion 1))
+              (Deposited 5 :| [])
+          )
+      commit store deposit `shouldReturn` Right ()
+      catchUpProjection store balanceProjection
+        `shouldReturn` Right (BalanceView 35)
+      rebuildProjection store balanceProjection
+        `shouldReturn` Right (BalanceView 35)
+      rebuildProjections store [balanceProjection]
+        `shouldReturn` Right [BalanceView 35]
+
+  it "rejects a malformed persisted view with a typed decode failure" $
+    withStore \store -> do
+      advanceProjection
+        store
+        (projectionUpdate balancesProjectionName (EventOffset 1) "not-json")
+        `shouldReturn` Right ProjectionAdvanced
+      catchUpProjection store balanceProjection
+        `shouldReturn` Left
+          ( ProjectionViewDecodeFailed
+              balancesProjectionName
+              (DecodeCause "invalid balance projection")
+          )
+
+  it "skips framework job events while advancing the global checkpoint" $
+    withStore \store -> do
+      let typedStore = mkStore store testLimits (pure jobId)
+      executeCommand typedStore accountKey (Open 10)
+        `shouldReturn` Right (Account 10)
+      executeCommand typedStore accountKey Notify
+        `shouldReturn` Right (Account 10)
+      catchUpProjection store balanceProjection
+        `shouldReturn` Right (BalanceView 10)
+      loaded <- loadProjection store balancesProjectionName
+      fmap (fmap projectionCheckpoint) loaded
+        `shouldBe` Right (Just (EventOffset 3))
+
 
 deliveryStoreContract
   :: forall backend
@@ -513,6 +576,31 @@ testLimits =
 balancesProjectionName :: ProjectionName
 balancesProjectionName =
   fromMaybe (panic "invalid projection name") (mkProjectionName "balances")
+
+
+balanceProjection :: Projection Account BalanceView BalanceProjectionError
+balanceProjection =
+  Projection
+    { name = balancesProjectionName
+    , initial = BalanceView 0
+    , apply = applyBalanceEvent
+    , encode = LazyByteString.toStrict . Aeson.encode
+    , decode =
+        first (const (DecodeCause "invalid balance projection"))
+          . Aeson.eitherDecodeStrict'
+    }
+
+
+applyBalanceEvent
+  :: BalanceView -> AccountEvent -> Either BalanceProjectionError BalanceView
+applyBalanceEvent (BalanceView balance) event = case event of
+  Opened amount -> Right (BalanceView (balance + amount))
+  Deposited amount -> Right (BalanceView (balance + amount))
+  NotificationQueued _ -> Right (BalanceView balance)
+
+
+projectionCheckpoint :: ProjectionState -> EventOffset
+projectionCheckpoint (ProjectionState checkpoint _) = checkpoint
 
 
 deliveryId :: DeliveryId
