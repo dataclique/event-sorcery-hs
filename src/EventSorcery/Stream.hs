@@ -41,6 +41,7 @@ data ExpectedVersion
 
 
 data StreamKey entity = StreamKey Text Text
+  deriving stock (Eq, Show)
 
 
 data EventMetadata = EventMetadata

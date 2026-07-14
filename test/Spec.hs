@@ -22,12 +22,15 @@ newtype Account = Account Word64
 data AccountCommand
   = Open Word64
   | Deposit Word64
+  | Notify
+  | InvalidDeposit
   deriving stock (Eq, Show)
 
 
 data AccountEvent
   = Opened Word64
   | Deposited Word64
+  | NotificationQueued Text
   deriving stock (Eq, Show, Generic)
   deriving anyclass (Aeson.FromJSON, Aeson.ToJSON)
 
@@ -40,19 +43,33 @@ data AccountApplyError = DepositBeforeOpen
   deriving stock (Eq, Show)
 
 
+newtype EmailJob = EmailJob Text
+
+
+instance Job EmailJob where
+  jobType _ = "email"
+  encodeJob (EmailJob recipient) = encodeUtf8 recipient
+
+
+instance Dispatches Account EmailJob where
+  injectDispatchIntent intent =
+    NotificationQueued (jobIdText (dispatchJobId intent))
+
+
 instance EventSourced Account where
   type EntityId Account = AccountId
   type Command Account = AccountCommand
   type Event Account = AccountEvent
   type CommandError Account = AccountCommandError
   type ApplyError Account = AccountApplyError
-  type Jobs Account = '[]
+  type Jobs Account = '[EmailJob]
 
 
   aggregateType _ = "account"
   encodeEntityId (AccountId identifier) = identifier
   eventType (Opened _) = "opened"
   eventType (Deposited _) = "deposited"
+  eventType (NotificationQueued _) = "notification-queued"
   eventVersion _ = EventVersion 1
   schemaVersion _ = SchemaVersion 1
   encodeEvent = LazyByteString.toStrict . Aeson.encode
@@ -60,12 +77,18 @@ instance EventSourced Account where
     first (const (DecodeCause "invalid account event")) . Aeson.eitherDecodeStrict'
   originate (Opened amount) = Right (Account amount)
   originate (Deposited _) = Left DepositBeforeOpen
+  originate (NotificationQueued _) = Left DepositBeforeOpen
   evolve (Account balance) (Deposited amount) = Right (Account (balance + amount))
   evolve account (Opened _) = Right account
+  evolve account (NotificationQueued _) = Right account
   initialize (Open amount) = Right (Events (Opened amount :| []))
   initialize (Deposit _) = Left AlreadyOpen
+  initialize Notify = Left AlreadyOpen
+  initialize InvalidDeposit = Right (Events (Deposited 1 :| []))
   transition _ (Open _) = Left AlreadyOpen
   transition _ (Deposit amount) = Right (Events (Deposited amount :| []))
+  transition _ Notify = Right (Dispatch (EmailJob "owner@example.com"))
+  transition _ InvalidDeposit = Right (Events (Deposited 1 :| []))
 
 
 main :: IO ()
@@ -133,6 +156,8 @@ main = hspec do
   jobStoreContract "SQLite job store" withSQLiteStore
   reactorStoreContract "in-memory reactor store" withMemoryStore
   reactorStoreContract "SQLite reactor store" withSQLiteStore
+  storeContract "in-memory typed store" withMemoryStore
+  storeContract "SQLite typed store" withSQLiteStore
 
 
 eventStoreContract
@@ -396,6 +421,70 @@ reactorStoreContract label withStore = describe label do
         `shouldReturn` Right (Just firstOutboxEntry)
 
 
+storeContract
+  :: forall backend
+   . ( Eq (BackendError backend)
+     , EventStore backend
+     , Show (BackendError backend)
+     )
+  => [Char]
+  -> (forall result. (backend -> IO result) -> IO result)
+  -> Spec
+storeContract label withBackend = describe label do
+  it "initializes, transitions, and reloads an entity" $ withBackend \backend -> do
+    let store = mkStore backend testLimits (pure jobId)
+    loadEntity store accountKey `shouldReturn` Right Nothing
+    executeCommand store accountKey (Open 10)
+      `shouldReturn` Right (Account 10)
+    executeCommand store accountKey (Deposit 5)
+      `shouldReturn` Right (Account 15)
+    loadEntity store accountKey `shouldReturn` Right (Just (Account 15))
+
+  it "returns typed command and pre-application failures without mutation" $
+    withBackend \backend -> do
+      let store = mkStore backend testLimits (pure jobId)
+      executeCommand store accountKey InvalidDeposit
+        `shouldReturn` Left (StoreDecisionRejected DepositBeforeOpen)
+      loadStream backend accountIdentity `shouldReturn` Right []
+      executeCommand store accountKey (Open 10)
+        `shouldReturn` Right (Account 10)
+      executeCommand store accountKey (Open 20)
+        `shouldReturn` Left (StoreCommandRejected AlreadyOpen)
+      origin <- loadStream backend accountIdentity
+      length <$> origin `shouldBe` Right 1
+
+  it "atomically commits a dispatch intent and framework job enqueue" $
+    withBackend \backend -> do
+      let store = mkStore backend testLimits (pure jobId)
+      executeCommand store accountKey (Open 10)
+        `shouldReturn` Right (Account 10)
+      executeCommand store accountKey Notify
+        `shouldReturn` Right (Account 10)
+      origin <- loadStream backend accountIdentity
+      length <$> origin `shouldBe` Right 2
+      jobEvents <- loadStream backend jobIdentity
+      fmap (fmap (.metadata)) jobEvents
+        `shouldBe` Right
+          [EventMetadata "job" "job-1" "enqueued" (EventVersion 1)]
+
+  it "leaves the origin unchanged when the job stream conflicts" $
+    withBackend \backend -> do
+      let store = mkStore backend testLimits (pure jobId)
+      executeCommand store accountKey (Open 10)
+        `shouldReturn` Right (Account 10)
+      executeCommand store accountKey Notify
+        `shouldReturn` Right (Account 10)
+      executeCommand store accountKey Notify
+        `shouldReturn` Left
+          ( StoreConcurrencyConflict
+              (JobStreamConflict jobId)
+              NoStream
+              (At (StreamVersion 1))
+          )
+      origin <- loadStream backend accountIdentity
+      length <$> origin `shouldBe` Right 2
+
+
 withMemoryStore :: (MemoryStore -> IO result) -> IO result
 withMemoryStore action = newMemoryStore >>= action
 
@@ -562,6 +651,10 @@ accountIdentity = StreamIdentity "account" "account-1"
 
 secondAccountIdentity :: StreamIdentity
 secondAccountIdentity = StreamIdentity "account" "account-2"
+
+
+jobIdentity :: StreamIdentity
+jobIdentity = StreamIdentity "job" "job-1"
 
 
 accountMetadata :: EventMetadata

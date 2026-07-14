@@ -10,6 +10,7 @@ module EventSorcery.Aggregate (
   Member,
   SchemaVersion (..),
   dispatchIntent,
+  dispatchJobId,
   jobIdText,
   mkJobId,
 ) where
@@ -100,3 +101,7 @@ jobIdText (JobId value) = value
 dispatchIntent :: forall job. Job job => JobId -> job -> DispatchIntent job
 dispatchIntent identifier job =
   DispatchIntent identifier (jobType (Proxy @job)) (encodeJob job)
+
+
+dispatchJobId :: DispatchIntent job -> JobId
+dispatchJobId (DispatchIntent identifier _ _) = identifier

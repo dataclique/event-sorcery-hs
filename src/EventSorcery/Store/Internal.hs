@@ -11,6 +11,9 @@ module EventSorcery.Store.Internal (
   StreamAppend (..),
   StreamIdentity (..),
   StoredEnvelope (..),
+  Store (..),
+  StoreConflict (..),
+  StoreError (..),
   Unrestricted (..),
   appendEvents,
   commitBatch,
@@ -88,6 +91,44 @@ deriving stock instance Eq (BackendError backend) => Eq (CommitError backend)
 
 deriving stock instance
   Show (BackendError backend) => Show (CommitError backend)
+
+
+data Store backend entity = Store backend CommitLimits (IO JobId)
+
+
+data StoreConflict entity
+  = EntityStreamConflict (StreamKey entity)
+  | JobStreamConflict JobId
+  | UnknownStreamConflict
+  deriving stock (Eq, Show)
+
+
+data StoreError backend entity
+  = StoreReplayFailed (ReplayError entity)
+  | StoreCommandRejected (CommandError entity)
+  | StoreDecisionRejected (ApplyError entity)
+  | StoreConcurrencyConflict
+      (StoreConflict entity)
+      ExpectedVersion
+      ExpectedVersion
+  | StoreBackendFailed (BackendError backend)
+  | StoreCommitLimitExceeded CommitLimitViolation
+
+
+deriving stock instance
+  ( Eq (ApplyError entity)
+  , Eq (BackendError backend)
+  , Eq (CommandError entity)
+  )
+  => Eq (StoreError backend entity)
+
+
+deriving stock instance
+  ( Show (ApplyError entity)
+  , Show (BackendError backend)
+  , Show (CommandError entity)
+  )
+  => Show (StoreError backend entity)
 
 
 class EventStore backend where
