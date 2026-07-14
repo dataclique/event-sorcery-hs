@@ -14,6 +14,7 @@ build-type:         Simple
 category:           Database
 extra-source-files:
   adrs/*.md
+  fourmolu.yaml
   README.md
 
 common strict
@@ -23,11 +24,17 @@ common strict
     DeriveAnyClass
     DerivingVia
     DuplicateRecordFields
+    GADTs
+    MultiParamTypeClasses
     NoFieldSelectors
     NoImplicitPrelude
     OverloadedRecordDot
     OverloadedStrings
+    StandaloneDeriving
+    TypeApplications
+    TypeFamilies
     TypeFamilyDependencies
+    UndecidableInstances
 
   ghc-options:
     -Wall -Wcompat -Werror -Widentities -Wincomplete-record-updates
@@ -36,8 +43,28 @@ common strict
 
 library
   import:          strict
-  exposed-modules: EventSorcery
+  exposed-modules:
+    EventSorcery
+    EventSorcery.Aggregate
+    EventSorcery.Stream
+
   hs-source-dirs:  src
   build-depends:
-    , base       >=4.18  && <5
-    , protolude  >=0.3.4 && <0.4
+    , base        >=4.18  && <5
+    , bytestring  >=0.11  && <0.13
+    , protolude   >=0.3.4 && <0.4
+    , text        >=2.0   && <2.2
+
+test-suite event-sorcery-test
+  import:         strict
+  type:           exitcode-stdio-1.0
+  main-is:        Spec.hs
+  hs-source-dirs: test
+  build-depends:
+    , aeson          >=2.2   && <2.3
+    , base           >=4.18  && <5
+    , bytestring     >=0.11  && <0.13
+    , event-sorcery
+    , hspec          >=2.11  && <2.12
+    , protolude      >=0.3.4 && <0.4
+    , text           >=2.0   && <2.2
