@@ -45,7 +45,7 @@ data MemoryState = MemoryState
 data MemoryReactorState
   = MemoryReactorState
       (Map.Map ReactorName EventOffset)
-      (Map.Map DeliveryId OutboxEntry)
+      (Map.Map DeliveryId OutboxRecord)
 
 
 data MemoryError
@@ -250,7 +250,13 @@ instance ReactorStore MemoryStore where
   loadOutboxEntry (MemoryStore memoryState) identifier = do
     current <- readTVarIO memoryState
     let MemoryReactorState _ outbox = current.reactors
-    pure (Right (Map.lookup identifier outbox))
+    pure (Right (outboxRecordEntry <$> Map.lookup identifier outbox))
+
+
+  loadOutboxStatus (MemoryStore memoryState) identifier = do
+    current <- readTVarIO memoryState
+    let MemoryReactorState _ outbox = current.reactors
+    pure (Right (outboxRecordStatus <$> Map.lookup identifier outbox))
 
 
   advanceReactor (MemoryStore memoryState) update =
@@ -261,7 +267,9 @@ instance ReactorStore MemoryStore where
         let MemoryReactorState checkpoints outbox = reactorState
             checkpoint = Map.lookup name checkpoints
             existing =
-              proposed >>= \entry -> Map.lookup (outboxDeliveryId entry) outbox
+              proposed >>= \entry ->
+                outboxRecordEntry
+                  <$> Map.lookup (outboxDeliveryId entry) outbox
         case decideReactorAdvance name offset proposed checkpoint existing of
           Left failure -> pure (Left failure)
           Right (result, nextCheckpoint, insertion) -> do
@@ -273,6 +281,44 @@ instance ReactorStore MemoryStore where
                     reactorState
             writeTVar memoryState (setMemoryReactor nextReactorState current)
             pure (Right result)
+
+
+  claimOutbox (MemoryStore memoryState) identifier window = atomically do
+    current <- readTVar memoryState
+    let MemoryReactorState _ outbox = current.reactors
+    case decideClaimOutbox identifier window (Map.lookup identifier outbox) of
+      Left failure -> pure (Left failure)
+      Right (claim, next) -> do
+        writeMemoryOutbox memoryState current identifier next
+        pure (Right claim)
+
+
+  acknowledgeOutbox (MemoryStore memoryState) identifier token =
+    transitionMemoryOutbox
+      memoryState
+      identifier
+      (fmap ((),) . decideAcknowledgeOutbox identifier token)
+
+
+  retryOutbox (MemoryStore memoryState) identifier token runAt =
+    transitionMemoryOutbox
+      memoryState
+      identifier
+      (decideRetryOutbox identifier token runAt)
+
+
+  deadLetterOutbox (MemoryStore memoryState) identifier token =
+    transitionMemoryOutbox
+      memoryState
+      identifier
+      (fmap ((),) . decideDeadLetterOutbox identifier token)
+
+
+  exhaustOutbox (MemoryStore memoryState) identifier token =
+    transitionMemoryOutbox
+      memoryState
+      identifier
+      (decideExhaustOutbox identifier token)
 
 
 instance SchemaStore MemoryStore where
@@ -557,7 +603,17 @@ updateMemoryReactor
       (maybe checkpoints (\offset -> Map.insert name offset checkpoints) checkpoint)
       ( maybe
           outbox
-          (\entry -> Map.insert (outboxDeliveryId entry) entry outbox)
+          ( \entry ->
+              Map.insert
+                (outboxDeliveryId entry)
+                ( OutboxRecord
+                    entry
+                    OutboxReady
+                    (OutboxLeaseToken 0)
+                    (OutboxAttempt 0)
+                )
+                outbox
+          )
           insertion
       )
 
@@ -567,6 +623,45 @@ setMemoryReactor
   reactors
   memoryState =
     memoryState {reactors = reactors}
+
+
+outboxRecordEntry :: OutboxRecord -> OutboxEntry
+outboxRecordEntry (OutboxRecord entry _ _ _) = entry
+
+
+outboxRecordStatus :: OutboxRecord -> OutboxStatus
+outboxRecordStatus (OutboxRecord _ status _ _) = status
+
+
+writeMemoryOutbox
+  :: TVar MemoryState
+  -> MemoryState
+  -> DeliveryId
+  -> OutboxRecord
+  -> STM ()
+writeMemoryOutbox memoryState current identifier record =
+  writeTVar memoryState (setMemoryReactor nextReactor current)
+  where
+    MemoryReactorState checkpoints outbox = current.reactors
+    nextReactor =
+      MemoryReactorState checkpoints (Map.insert identifier record outbox)
+
+
+transitionMemoryOutbox
+  :: TVar MemoryState
+  -> DeliveryId
+  -> ( Maybe OutboxRecord
+       -> Either (OutboxError MemoryStore) (result, OutboxRecord)
+     )
+  -> IO (Either (OutboxError MemoryStore) result)
+transitionMemoryOutbox memoryState identifier decide = atomically do
+  current <- readTVar memoryState
+  let MemoryReactorState _ outbox = current.reactors
+  case decide (Map.lookup identifier outbox) of
+    Left failure -> pure (Left failure)
+    Right (result, next) -> do
+      writeMemoryOutbox memoryState current identifier next
+      pure (Right result)
 
 
 invalidateMemorySchema :: SchemaTarget -> MemoryState -> MemoryState

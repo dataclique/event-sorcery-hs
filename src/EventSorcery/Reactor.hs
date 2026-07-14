@@ -1,6 +1,18 @@
 module EventSorcery.Reactor (
   OutboxEntry (..),
+  OutboxAttempt (..),
+  OutboxAttemptLimit,
+  OutboxClaim (..),
+  OutboxDeadReason (..),
+  OutboxDeliveryFailure (..),
+  OutboxDeliveryResult (..),
+  OutboxError (..),
+  OutboxInstant (..),
+  OutboxLeaseToken (..),
+  OutboxLeaseWindow,
   OutboxPayload (..),
+  OutboxRuntime,
+  OutboxStatus (..),
   Reactor (..),
   ReactorCommit (..),
   ReactorContext,
@@ -10,16 +22,21 @@ module EventSorcery.Reactor (
   ReactorStore (..),
   ReactorUpdate,
   catchUpReactor,
+  mkOutboxAttemptLimit,
+  mkOutboxLeaseWindow,
+  mkOutboxRuntime,
   mkReactorName,
   reactorContextOffset,
   reactorContextPosition,
   reactorContextStream,
   reactorUpdate,
+  runOutboxOnce,
 ) where
 
 import Conduit (foldMC, runConduit, transPipe, (.|))
 import Data.Text qualified as Text
 import EventSorcery.Aggregate
+import EventSorcery.Delivery.Internal (DeliveryId)
 import EventSorcery.Reactor.Internal
 import EventSorcery.Store.Internal
 import EventSorcery.Stream
@@ -36,6 +53,107 @@ reactorUpdate
   :: ReactorName -> EventOffset -> Maybe OutboxEntry -> ReactorUpdate
 reactorUpdate name offset entry =
   ReactorUpdate (Unrestricted (name, offset, entry))
+
+
+mkOutboxAttemptLimit :: Word64 -> Maybe OutboxAttemptLimit
+mkOutboxAttemptLimit 0 = Nothing
+mkOutboxAttemptLimit attempts = Just (OutboxAttemptLimit attempts)
+
+
+mkOutboxLeaseWindow
+  :: OutboxInstant -> OutboxInstant -> Maybe OutboxLeaseWindow
+mkOutboxLeaseWindow claimedAt expiresAt
+  | claimedAt < expiresAt = Just (OutboxLeaseWindow claimedAt expiresAt)
+  | otherwise = Nothing
+
+
+mkOutboxRuntime
+  :: backend
+  -> OutboxAttemptLimit
+  -> (OutboxAttempt -> OutboxInstant)
+  -> OutboxRuntime backend
+mkOutboxRuntime = OutboxRuntime
+
+
+runOutboxOnce
+  :: ReactorStore backend
+  => OutboxRuntime backend
+  -> DeliveryId
+  -> OutboxLeaseWindow
+  -> ( DeliveryId
+       -> OutboxPayload
+       -> IO (Either (OutboxDeliveryFailure failure) ())
+     )
+  -> IO
+       ( Either
+           (OutboxError backend)
+           (OutboxDeliveryResult failure)
+       )
+runOutboxOnce runtime@(OutboxRuntime backend _ _) identifier window deliver = do
+  claimed <- claimOutbox backend identifier window
+  case claimed of
+    Left failure -> pure (Left failure)
+    Right (OutboxClaim token attempts (OutboxEntry delivery payload)) -> do
+      delivered <- deliver delivery payload
+      case delivered of
+        Right () -> do
+          acknowledged <- acknowledgeOutbox backend identifier token
+          pure (DeliverySucceeded <$ acknowledged)
+        Left (TerminalDelivery failure) -> do
+          deadLettered <- deadLetterOutbox backend identifier token
+          pure (DeliveryRejected failure <$ deadLettered)
+        Left (TransientDelivery failure) ->
+          persistTransientDelivery
+            runtime
+            identifier
+            token
+            attempts
+            failure
+
+
+persistTransientDelivery
+  :: ReactorStore backend
+  => OutboxRuntime backend
+  -> DeliveryId
+  -> OutboxLeaseToken
+  -> OutboxAttempt
+  -> failure
+  -> IO
+       ( Either
+           (OutboxError backend)
+           (OutboxDeliveryResult failure)
+       )
+persistTransientDelivery
+  (OutboxRuntime backend limit schedule)
+  identifier
+  token
+  attempts
+  failure = case nextOutboxAttempt attempts of
+    Nothing -> pure (Left (OutboxAttemptExhausted identifier))
+    Just next
+      | reachedOutboxAttemptLimit limit next -> do
+          exhausted <- exhaustOutbox backend identifier token
+          pure (DeliveryRetriesExhausted <$> exhausted <*> pure failure)
+      | otherwise -> do
+          let runAt = schedule next
+          retried <- retryOutbox backend identifier token runAt
+          pure
+            ( (\actual -> DeliveryRetryScheduled actual runAt failure)
+                <$> retried
+            )
+
+
+nextOutboxAttempt :: OutboxAttempt -> Maybe OutboxAttempt
+nextOutboxAttempt (OutboxAttempt attempts)
+  | attempts == maxBound = Nothing
+  | otherwise = Just (OutboxAttempt (attempts + 1))
+
+
+reachedOutboxAttemptLimit
+  :: OutboxAttemptLimit -> OutboxAttempt -> Bool
+reachedOutboxAttemptLimit
+  (OutboxAttemptLimit limit)
+  (OutboxAttempt attempts) = attempts >= limit
 
 
 reactorContextOffset :: ReactorContext -> EventOffset

@@ -78,6 +78,16 @@ data JobRow = JobRow ByteString Text Word64 (Maybe Word64) Word64
 data OutboxRow = OutboxRow Text ByteString
 
 
+data OutboxRecordRow
+  = OutboxRecordRow
+      Text
+      ByteString
+      Text
+      Word64
+      (Maybe Word64)
+      Word64
+
+
 instance FromRow EventRow where
   fromRow = EventRow <$> field <*> field <*> field <*> field
 
@@ -108,6 +118,17 @@ instance FromRow JobRow where
 
 instance FromRow OutboxRow where
   fromRow = OutboxRow <$> field <*> field
+
+
+instance FromRow OutboxRecordRow where
+  fromRow =
+    OutboxRecordRow
+      <$> field
+      <*> field
+      <*> field
+      <*> field
+      <*> field
+      <*> field
 
 
 openSQLiteStore :: FilePath -> IO (Either SQLiteError SQLiteStore)
@@ -327,6 +348,13 @@ instance ReactorStore SQLiteStore where
       Right decoded -> decoded
 
 
+  loadOutboxStatus (SQLiteStore connection _) identifier = do
+    loaded <- trySQLite (loadSQLiteOutboxRecord connection identifier)
+    pure case loaded of
+      Left failure -> Left (SQLiteReadFailed failure)
+      Right decoded -> fmap outboxRecordStatus <$> decoded
+
+
   advanceReactor store@(SQLiteStore connection _) update =
     case consumeReactorUpdate update of
       Unrestricted (name, offset, proposed) -> do
@@ -340,6 +368,72 @@ instance ReactorStore SQLiteStore where
           Left failure ->
             Left (ReactorBackendFailed (SQLiteCommitFailed failure))
           Right result -> result
+
+
+  claimOutbox store@(SQLiteStore connection _) identifier window = do
+    claimed <-
+      trySQLite
+        ( withSQLiteTransaction
+            store
+            (claimOutboxTransaction connection identifier window)
+        )
+    pure (sqliteOutboxResult claimed)
+
+
+  acknowledgeOutbox store@(SQLiteStore connection _) identifier token = do
+    acknowledged <-
+      trySQLite
+        ( withSQLiteTransaction
+            store
+            ( transitionOutboxRecord
+                connection
+                identifier
+                (fmap ((),) . decideAcknowledgeOutbox identifier token)
+            )
+        )
+    pure (sqliteOutboxResult acknowledged)
+
+
+  retryOutbox store@(SQLiteStore connection _) identifier token runAt = do
+    retried <-
+      trySQLite
+        ( withSQLiteTransaction
+            store
+            ( transitionOutboxRecord
+                connection
+                identifier
+                (decideRetryOutbox identifier token runAt)
+            )
+        )
+    pure (sqliteOutboxResult retried)
+
+
+  deadLetterOutbox store@(SQLiteStore connection _) identifier token = do
+    deadLettered <-
+      trySQLite
+        ( withSQLiteTransaction
+            store
+            ( transitionOutboxRecord
+                connection
+                identifier
+                (fmap ((),) . decideDeadLetterOutbox identifier token)
+            )
+        )
+    pure (sqliteOutboxResult deadLettered)
+
+
+  exhaustOutbox store@(SQLiteStore connection _) identifier token = do
+    exhausted <-
+      trySQLite
+        ( withSQLiteTransaction
+            store
+            ( transitionOutboxRecord
+                connection
+                identifier
+                (decideExhaustOutbox identifier token)
+            )
+        )
+    pure (sqliteOutboxResult exhausted)
 
 
 instance SchemaStore SQLiteStore where
@@ -430,6 +524,18 @@ migrate connection = do
       delivery_id TEXT PRIMARY KEY,
       payload_type TEXT NOT NULL,
       payload BLOB NOT NULL
+    )
+    """
+  execute_
+    connection
+    """
+    CREATE TABLE IF NOT EXISTS outbox_state (
+      delivery_id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      lease_token INTEGER NOT NULL,
+      lease_expires INTEGER,
+      attempts INTEGER NOT NULL,
+      FOREIGN KEY (delivery_id) REFERENCES outbox (delivery_id)
     )
     """
   execute_
@@ -1111,7 +1217,7 @@ decodeOutboxRow (OutboxRow payloadType payload) = case payloadType of
 storeOutboxEntry :: Connection -> OutboxEntry -> IO ()
 storeOutboxEntry
   connection
-  (OutboxEntry (DeliveryId delivery) payload) =
+  entry@(OutboxEntry (DeliveryId delivery) payload) = do
     execute
       connection
       """
@@ -1119,6 +1225,14 @@ storeOutboxEntry
       VALUES (?, ?, ?)
       """
       (delivery, outboxPayloadType payload, outboxPayloadBytes payload)
+    storeOutboxRecord
+      connection
+      ( OutboxRecord
+          entry
+          OutboxReady
+          (OutboxLeaseToken 0)
+          (OutboxAttempt 0)
+      )
 
 
 outboxPayloadType :: OutboxPayload -> Text
@@ -1131,6 +1245,162 @@ outboxPayloadBytes :: OutboxPayload -> ByteString
 outboxPayloadBytes payload = case payload of
   CommandDelivery bytes -> bytes
   JobDispatch bytes -> bytes
+
+
+loadSQLiteOutboxRecord
+  :: Connection
+  -> DeliveryId
+  -> IO (Either SQLiteError (Maybe OutboxRecord))
+loadSQLiteOutboxRecord connection identifier@(DeliveryId delivery) = do
+  rows <-
+    query
+      connection
+      """
+      SELECT
+        outbox.payload_type,
+        outbox.payload,
+        COALESCE(outbox_state.status, 'ready'),
+        COALESCE(outbox_state.lease_token, 0),
+        outbox_state.lease_expires,
+        COALESCE(outbox_state.attempts, 0)
+      FROM outbox
+      LEFT JOIN outbox_state USING (delivery_id)
+      WHERE outbox.delivery_id = ?
+      """
+      (Only delivery)
+  pure case rows of
+    row : _ -> Just <$> decodeOutboxRecordRow identifier row
+    [] -> Right Nothing
+
+
+decodeOutboxRecordRow
+  :: DeliveryId
+  -> OutboxRecordRow
+  -> Either SQLiteError OutboxRecord
+decodeOutboxRecordRow
+  identifier
+  (OutboxRecordRow payloadType payload status token expires attempts) = do
+    decodedPayload <- decodeOutboxRow (OutboxRow payloadType payload)
+    decodedStatus <- decodeOutboxStatus status expires
+    pure
+      ( OutboxRecord
+          (OutboxEntry identifier decodedPayload)
+          decodedStatus
+          (OutboxLeaseToken token)
+          (OutboxAttempt attempts)
+      )
+
+
+decodeOutboxStatus
+  :: Text -> Maybe Word64 -> Either SQLiteError OutboxStatus
+decodeOutboxStatus status expires = case (status, expires) of
+  ("ready", Nothing) -> Right OutboxReady
+  ("scheduled", Just runAt) ->
+    Right (OutboxScheduled (OutboxInstant runAt))
+  ("leased", Just expiresAt) ->
+    Right (OutboxLeased (OutboxInstant expiresAt))
+  ("delivered", Nothing) -> Right OutboxDelivered
+  ("dead-retries-exhausted", Nothing) ->
+    Right (OutboxDeadLettered OutboxRetriesExhausted)
+  ("dead-rejected", Nothing) ->
+    Right (OutboxDeadLettered OutboxRejected)
+  _ -> Left SQLiteStoredDataInvalid
+
+
+storeOutboxRecord :: Connection -> OutboxRecord -> IO ()
+storeOutboxRecord
+  connection
+  ( OutboxRecord
+      (OutboxEntry (DeliveryId delivery) _)
+      status
+      (OutboxLeaseToken token)
+      (OutboxAttempt attempts)
+    ) =
+    execute
+      connection
+      """
+      INSERT INTO outbox_state (
+        delivery_id,
+        status,
+        lease_token,
+        lease_expires,
+        attempts
+      )
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT (delivery_id) DO UPDATE SET
+        status = excluded.status,
+        lease_token = excluded.lease_token,
+        lease_expires = excluded.lease_expires,
+        attempts = excluded.attempts
+      """
+      ( delivery
+      , outboxStatusText status
+      , token
+      , outboxLeaseExpiry status
+      , attempts
+      )
+
+
+outboxStatusText :: OutboxStatus -> Text
+outboxStatusText status = case status of
+  OutboxReady -> "ready"
+  OutboxScheduled _ -> "scheduled"
+  OutboxLeased _ -> "leased"
+  OutboxDelivered -> "delivered"
+  OutboxDeadLettered OutboxRetriesExhausted ->
+    "dead-retries-exhausted"
+  OutboxDeadLettered OutboxRejected -> "dead-rejected"
+
+
+outboxLeaseExpiry :: OutboxStatus -> Maybe Word64
+outboxLeaseExpiry status = case status of
+  OutboxScheduled (OutboxInstant runAt) -> Just runAt
+  OutboxLeased (OutboxInstant expiresAt) -> Just expiresAt
+  OutboxReady -> Nothing
+  OutboxDelivered -> Nothing
+  OutboxDeadLettered _ -> Nothing
+
+
+outboxRecordStatus :: OutboxRecord -> OutboxStatus
+outboxRecordStatus (OutboxRecord _ status _ _) = status
+
+
+claimOutboxTransaction
+  :: Connection
+  -> DeliveryId
+  -> OutboxLeaseWindow
+  -> IO (Either (OutboxError SQLiteStore) OutboxClaim)
+claimOutboxTransaction connection identifier window = do
+  current <- loadSQLiteOutboxRecord connection identifier
+  case first OutboxBackendFailed current
+    >>= decideClaimOutbox identifier window of
+    Left failure -> pure (Left failure)
+    Right (claim, next) -> do
+      storeOutboxRecord connection next
+      pure (Right claim)
+
+
+transitionOutboxRecord
+  :: Connection
+  -> DeliveryId
+  -> ( Maybe OutboxRecord
+       -> Either (OutboxError SQLiteStore) (result, OutboxRecord)
+     )
+  -> IO (Either (OutboxError SQLiteStore) result)
+transitionOutboxRecord connection identifier decide = do
+  current <- loadSQLiteOutboxRecord connection identifier
+  case first OutboxBackendFailed current >>= decide of
+    Left failure -> pure (Left failure)
+    Right (result, next) -> do
+      storeOutboxRecord connection next
+      pure (Right result)
+
+
+sqliteOutboxResult
+  :: Either SQLiteFailure (Either (OutboxError SQLiteStore) result)
+  -> Either (OutboxError SQLiteStore) result
+sqliteOutboxResult =
+  either (Left . OutboxBackendFailed . SQLiteCommitFailed) identity
 
 
 storeReactorCheckpoint

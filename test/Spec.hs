@@ -282,6 +282,8 @@ main = hspec do
   reactorStoreContract "SQLite reactor store" withSQLiteStore
   reactorRunnerContract "in-memory reactor runner" withMemoryStore
   reactorRunnerContract "SQLite reactor runner" withSQLiteStore
+  outboxRuntimeContract "in-memory outbox runtime" withMemoryStore
+  outboxRuntimeContract "SQLite outbox runtime" withSQLiteStore
   schemaStoreContract "in-memory schema store" withMemoryStore
   schemaStoreContract "SQLite schema store" withSQLiteStore
   storeContract "in-memory typed store" withMemoryStore
@@ -793,6 +795,96 @@ reactorRunnerContract label withStore = describe label do
         `shouldReturn` Right (EventOffset 2)
 
 
+outboxRuntimeContract
+  :: forall backend
+   . ( Eq (BackendError backend)
+     , ReactorStore backend
+     , Show (BackendError backend)
+     )
+  => [Char]
+  -> (forall result. (backend -> IO result) -> IO result)
+  -> Spec
+outboxRuntimeContract label withStore = describe label do
+  it "fences a delivery worker after its lease is replaced" $
+    withStore \store -> do
+      advanceReactor store firstReactorUpdate
+        `shouldReturn` Right ReactorCommitted
+      claimOutbox store deliveryId firstOutboxLease
+        `shouldReturn` Right
+          ( OutboxClaim
+              (OutboxLeaseToken 1)
+              (OutboxAttempt 0)
+              firstOutboxEntry
+          )
+      claimOutbox store deliveryId (outboxLeaseWindow 15 25)
+        `shouldReturn` Left
+          (OutboxLeaseUnavailable deliveryId (OutboxInstant 20))
+      claimOutbox store deliveryId secondOutboxLease
+        `shouldReturn` Right
+          ( OutboxClaim
+              (OutboxLeaseToken 2)
+              (OutboxAttempt 0)
+              firstOutboxEntry
+          )
+      acknowledgeOutbox store deliveryId (OutboxLeaseToken 1)
+        `shouldReturn` Left
+          ( OutboxLeaseLost
+              deliveryId
+              (OutboxLeaseToken 1)
+              (OutboxLeaseToken 2)
+          )
+      acknowledgeOutbox store deliveryId (OutboxLeaseToken 2)
+        `shouldReturn` Right ()
+
+  it "retries transient failures and then durably acknowledges success" $
+    withStore \store -> do
+      advanceReactor store firstReactorUpdate
+        `shouldReturn` Right ReactorCommitted
+      let runtime =
+            mkOutboxRuntime store outboxAttemptLimit outboxRetrySchedule
+      runOutboxOnce runtime deliveryId firstOutboxLease transientDelivery
+        `shouldReturn` Right
+          ( DeliveryRetryScheduled
+              (OutboxAttempt 1)
+              (OutboxInstant 30)
+              ProbeFailure
+          )
+      runOutboxOnce runtime deliveryId secondOutboxLease successfulDelivery
+        `shouldReturn` Right DeliverySucceeded
+      loadOutboxStatus store deliveryId
+        `shouldReturn` Right (Just OutboxDelivered)
+
+  it "retains terminal failures as dead letters" $ withStore \store -> do
+    advanceReactor store firstReactorUpdate
+      `shouldReturn` Right ReactorCommitted
+    let runtime =
+          mkOutboxRuntime store outboxAttemptLimit outboxRetrySchedule
+    runOutboxOnce runtime deliveryId firstOutboxLease terminalDelivery
+      `shouldReturn` Right (DeliveryRejected ProbeFailure)
+    loadOutboxStatus store deliveryId
+      `shouldReturn` Right
+        (Just (OutboxDeadLettered OutboxRejected))
+    runOutboxOnce runtime deliveryId secondOutboxLease successfulDelivery
+      `shouldReturn` Left
+        (OutboxAlreadyDeadLettered deliveryId OutboxRejected)
+
+  it "dead-letters a transient failure at its attempt limit" $
+    withStore \store -> do
+      advanceReactor store firstReactorUpdate
+        `shouldReturn` Right ReactorCommitted
+      let runtime =
+            mkOutboxRuntime
+              store
+              singleOutboxAttemptLimit
+              outboxRetrySchedule
+      runOutboxOnce runtime deliveryId firstOutboxLease transientDelivery
+        `shouldReturn` Right
+          (DeliveryRetriesExhausted (OutboxAttempt 1) ProbeFailure)
+      loadOutboxStatus store deliveryId
+        `shouldReturn` Right
+          (Just (OutboxDeadLettered OutboxRetriesExhausted))
+
+
 storeContract
   :: forall backend
    . ( Eq (BackendError backend)
@@ -1137,6 +1229,59 @@ singleAttemptLimit =
 
 retrySchedule :: AttemptCount -> LeaseInstant
 retrySchedule (AttemptCount attempt) = LeaseInstant (40 + attempt)
+
+
+outboxAttemptLimit :: OutboxAttemptLimit
+outboxAttemptLimit =
+  fromMaybe (panic "invalid outbox attempt limit") (mkOutboxAttemptLimit 2)
+
+
+singleOutboxAttemptLimit :: OutboxAttemptLimit
+singleOutboxAttemptLimit =
+  fromMaybe (panic "invalid outbox attempt limit") (mkOutboxAttemptLimit 1)
+
+
+outboxRetrySchedule :: OutboxAttempt -> OutboxInstant
+outboxRetrySchedule (OutboxAttempt attempt) = OutboxInstant (29 + attempt)
+
+
+firstOutboxLease :: OutboxLeaseWindow
+firstOutboxLease = outboxLeaseWindow 10 20
+
+
+secondOutboxLease :: OutboxLeaseWindow
+secondOutboxLease = outboxLeaseWindow 30 40
+
+
+outboxLeaseWindow :: Word64 -> Word64 -> OutboxLeaseWindow
+outboxLeaseWindow claimedAt expiresAt =
+  fromMaybe
+    (panic "invalid outbox lease window")
+    ( mkOutboxLeaseWindow
+        (OutboxInstant claimedAt)
+        (OutboxInstant expiresAt)
+    )
+
+
+transientDelivery
+  :: DeliveryId
+  -> OutboxPayload
+  -> IO (Either (OutboxDeliveryFailure ProbeFailure) ())
+transientDelivery _ _ = pure (Left (TransientDelivery ProbeFailure))
+
+
+terminalDelivery
+  :: DeliveryId
+  -> OutboxPayload
+  -> IO (Either (OutboxDeliveryFailure ProbeFailure) ())
+terminalDelivery _ _ = pure (Left (TerminalDelivery ProbeFailure))
+
+
+successfulDelivery
+  :: DeliveryId
+  -> OutboxPayload
+  -> IO (Either (OutboxDeliveryFailure ProbeFailure) ())
+successfulDelivery _ _ = pure (Right ())
 
 
 recordProbeInvocation :: ProbeInput -> ProbeInvocation -> IO ()
