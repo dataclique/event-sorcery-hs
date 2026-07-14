@@ -61,11 +61,44 @@ that contains either a non-empty batch of domain events or one typed job
 dispatch. Dispatch requires type-level membership in `Jobs entity`; an
 undeclared job is a compile error. There is no empty successful decision.
 
+A dispatch carries one job value and cannot accompany arbitrary domain events.
+Its constructor requires `Job job`, `Member job (Jobs entity)`, and
+`Dispatches entity job`. The last capability injects the framework-owned
+`DispatchIntent job` (a fresh `JobId` plus the serialized job intent) into
+`Event entity`. The framework expands the dispatch into exactly two events:
+
+- the injected intent event targets the origin entity stream and uses the
+  stream head loaded for the command as its expected version; and
+- `JobEnqueued` targets the framework-owned `("job", JobId)` stream and uses
+  `NoStream`, because the framework generated that job id for this dispatch.
+
+Before persistence, the intent event is applied to the origin entity and
+`JobEnqueued` is applied to an empty framework job aggregate. A failure in
+either fold rejects the decision. The two validated events then form one
+two-stream `CommitBatch`; an expected-head mismatch or backend failure leaves
+both streams unchanged. For a normal event decision, every event in the
+non-empty batch is pre-applied to the origin entity in order and only that
+origin stream is committed.
+
 Replay is a total fold returning `Either (ReplayError entity) (Maybe entity)`.
 The core pre-applies every decided event before persistence, so an invalid event
 batch cannot poison a stream and fail only on its next load. Persisted decode,
 metadata, ordering, and fold failures remain distinct constructors of
 `ReplayError` and `StoreError`; errors are never flattened to text.
+
+The public ownership boundary is:
+
+| Failure | Owning error | Constructor and cause |
+| --- | --- | --- |
+| Event payload cannot decode or violates a decoded newtype invariant | `ReplayError entity` | `EventDecodeFailed StreamPosition DecodeCause`; wraps a sanitized decoder cause, never payload bytes |
+| Aggregate type, aggregate id, event type, or event version differs from the requested stream contract | `ReplayError entity` | `EventMetadataMismatch StreamPosition MetadataMismatch`; wraps typed expected and actual metadata |
+| Sequence is missing, duplicated, or out of order | `ReplayError entity` | `EventSequenceMismatch ExpectedSequence ActualSequence`; no backend exception |
+| `originate` or `evolve` rejects an event | `ReplayError entity` | `EventApplicationFailed StreamPosition (ApplyError entity)`; preserves the typed domain cause |
+| Loading a stream cannot replay it | `StoreError backend entity` | `ReplayFailed (ReplayError entity)`; the only nesting of `ReplayError` in `StoreError` |
+| `initialize` or `transition` rejects a command | `StoreError backend entity` | `CommandRejected (CommandError entity)`; preserves the typed domain cause |
+| An expected stream head changed | `StoreError backend entity` | `ConcurrencyConflict StreamKey ExpectedVersion ActualVersion`; an expected outcome, not a wrapped driver exception |
+| Backend read, commit, checkpoint, or lease operation fails | `StoreError backend entity` | `BackendFailed (BackendError backend)`; preserves the typed backend cause while its renderer remains payload-redacted |
+| A validated payload or batch limit is exceeded | `StoreError backend entity` | `CommitLimitExceeded CommitLimitViolation`; no backend write is attempted |
 
 Consumers use `Store backend entity`, `Projection backend entity view`,
 `Reactor backend entity`, and `JobRuntime backend`. Backend and entity types are
@@ -124,13 +157,26 @@ incompatible snapshot and replay from events. A compacted stream fails closed
 when its snapshot is incompatible because the snapshot may be its only complete
 history.
 
-Reactors consume committed envelopes through durable checkpoints. They may
-enqueue standalone jobs or send commands; they do not run external side effects
-inline. Jobs are event-sourced state machines with leases, fencing tokens,
-attempt counts, explicit transient/terminal failure classification, retry,
-defer, and dead-letter outcomes. The first claim may submit an external action;
-later claims must reconcile the earlier attempt before any resubmission is
-authorized.
+Reactors consume committed envelopes through durable checkpoints. A reactor may
+return a standalone-job dispatch or a typed command delivery, but neither is
+executed inline. The runner atomically inserts a durable outbox entry and
+advances the reactor checkpoint; a crash can therefore leave both pending or
+neither recorded, never a checkpoint without its effect.
+
+Every outbox entry has a stable `DeliveryId`. Workers retry transient delivery
+failures and dead-letter terminal ones. Command delivery enters the target
+`Store` through a dedicated delivery operation that atomically records the
+`DeliveryId` receipt with any target events. Repeating an acknowledged or
+ambiguous delivery observes the receipt and succeeds without handling the
+command again. Thus a checkpoint restart may duplicate an outbox attempt but
+cannot lose a command or produce its events twice. A reactor cannot emit an
+untracked inline command.
+
+Jobs use the same durable outbox, then continue as event-sourced state machines
+with leases, fencing tokens, attempt counts, explicit transient/terminal
+failure classification, retry, defer, and dead-letter outcomes. The first claim
+may submit an external action; later claims must reconcile the earlier attempt
+before any resubmission is authorized.
 
 ### Package and toolchain
 
@@ -157,10 +203,15 @@ version and a superseding ADR explicitly permit a break.
 ## Trust Boundaries and Required Abuse Tests
 
 Persisted event/snapshot payloads and metadata cross from storage into typed
-domain code. SQLite files can be modified outside the process. Concurrent
-writers cross the optimistic-concurrency boundary. Reactor checkpoints and job
-leases cross crash/restart and competing-worker boundaries. User job code
-crosses from an external system back into durable framework state.
+domain code and may be malformed through software defects or incompatible
+schema evolution. Concurrent writers cross the optimistic-concurrency boundary.
+Reactor checkpoints and job leases cross crash/restart and competing-worker
+boundaries. User job code crosses from an external system back into durable
+framework state. The SQLite database file, its directory, and the process that
+opens it are inside the deployment's trusted boundary. The library validates
+malformed or inconsistent stored data, but does not authenticate a valid row
+replacement by an actor with file-write access. OS permissions, volume access,
+and backup integrity protect that boundary.
 
 The protected assets are the immutability and ordering of event history,
 correct aggregate and projection state, atomic dispatch intent plus enqueue,
@@ -177,6 +228,8 @@ unimplemented behavior and then pass without changing their assertions:
 - two commands racing on one stream yield one commit and one explicit conflict;
 - failure during a two-stream dispatch commit leaves neither the intent nor the
   enqueue visible;
+- a reactor crash cannot advance its checkpoint without its command outbox row,
+  and retrying one `DeliveryId` cannot handle the target command twice;
 - an oversized event is rejected before either backend stores it;
 - projection restart may repeat the current envelope but cannot skip the next
   sequence or advance a checkpoint without its view update;
@@ -189,13 +242,15 @@ unimplemented behavior and then pass without changing their assertions:
   raw payload or metadata.
 
 STRIDE consequences are handled as follows: identity and metadata spoofing are
-checked against the typed stream key; tampering is caught by decoding, sequence
-validation, immutable rows, and compare-and-append; repudiation is answered by
-the append-only history and job verdict events; information disclosure is
-limited by redacted errors and no payload logging; denial of service is bounded
-by validated payload and batch limits; and elevation of privilege is prevented
-by keeping serialized commit constructors behind `Store` and fencing every job
-state transition.
+checked against the typed stream key; malformed data, sequence tampering through
+the library API, and concurrent writes are caught by decoding, ordering checks,
+append-only operations, and compare-and-append, while authenticated detection
+of a valid SQLite row replacement is explicitly not claimed; repudiation is
+answered by the append-only history, delivery receipts, and job verdict events;
+information disclosure is limited by redacted errors and no payload logging;
+denial of service is bounded by validated payload and batch limits; and
+elevation of privilege is prevented by keeping serialized commit constructors
+behind `Store` and fencing every job state transition.
 
 ## Alternatives Considered
 
