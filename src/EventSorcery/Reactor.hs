@@ -8,6 +8,7 @@ module EventSorcery.Reactor (
   OutboxDeliveryResult (..),
   OutboxError (..),
   OutboxInstant (..),
+  OutboxJobError (..),
   OutboxLeaseToken (..),
   OutboxLeaseWindow,
   OutboxPayload (..),
@@ -22,6 +23,8 @@ module EventSorcery.Reactor (
   ReactorStore (..),
   ReactorUpdate,
   catchUpReactor,
+  deliverOutboxJob,
+  jobOutboxEntry,
   mkOutboxAttemptLimit,
   mkOutboxLeaseWindow,
   mkOutboxRuntime,
@@ -36,7 +39,8 @@ module EventSorcery.Reactor (
 import Conduit (foldMC, runConduit, transPipe, (.|))
 import Data.Text qualified as Text
 import EventSorcery.Aggregate
-import EventSorcery.Delivery.Internal (DeliveryId)
+import EventSorcery.Delivery.Internal (DeliveryId (..))
+import EventSorcery.Job.Internal
 import EventSorcery.Reactor.Internal
 import EventSorcery.Store.Internal
 import EventSorcery.Stream
@@ -53,6 +57,52 @@ reactorUpdate
   :: ReactorName -> EventOffset -> Maybe OutboxEntry -> ReactorUpdate
 reactorUpdate name offset entry =
   ReactorUpdate (Unrestricted (name, offset, entry))
+
+
+jobOutboxEntry :: forall job. Job job => DeliveryId -> job -> OutboxEntry
+jobOutboxEntry identifier job =
+  OutboxEntry identifier (JobDispatch (encodeStoredJob job))
+
+
+deliverOutboxJob
+  :: JobStore backend
+  => backend
+  -> DeliveryId
+  -> OutboxPayload
+  -> IO
+       ( Either
+           (OutboxDeliveryFailure (OutboxJobError backend))
+           ()
+       )
+deliverOutboxJob backend identifier payload =
+  case payload of
+    CommandDelivery _ ->
+      pure
+        ( Left
+            (TerminalDelivery (OutboxExpectedJobDispatch identifier))
+        )
+    JobDispatch stored -> case identifier of
+      DeliveryId encodedIdentifier -> case mkJobId encodedIdentifier of
+        Nothing ->
+          pure
+            ( Left
+                (TerminalDelivery (OutboxInvalidJobIdentifier identifier))
+            )
+        Just jobIdentifier -> do
+          enqueued <- enqueueJob backend jobIdentifier stored
+          pure (classifyJobEnqueue enqueued)
+
+
+classifyJobEnqueue
+  :: Either (JobError backend) JobEnqueue
+  -> Either (OutboxDeliveryFailure (OutboxJobError backend)) ()
+classifyJobEnqueue result = case result of
+  Right JobEnqueued -> Right ()
+  Right JobAlreadyEnqueued -> Right ()
+  Left failure@(JobBackendFailed _) ->
+    Left (TransientDelivery (OutboxJobEnqueueFailed failure))
+  Left failure ->
+    Left (TerminalDelivery (OutboxJobEnqueueFailed failure))
 
 
 mkOutboxAttemptLimit :: Word64 -> Maybe OutboxAttemptLimit

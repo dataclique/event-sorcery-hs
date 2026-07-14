@@ -284,6 +284,8 @@ main = hspec do
   reactorRunnerContract "SQLite reactor runner" withSQLiteStore
   outboxRuntimeContract "in-memory outbox runtime" withMemoryStore
   outboxRuntimeContract "SQLite outbox runtime" withSQLiteStore
+  outboxJobContract "in-memory outbox job delivery" withMemoryStore
+  outboxJobContract "SQLite outbox job delivery" withSQLiteStore
   schemaStoreContract "in-memory schema store" withMemoryStore
   schemaStoreContract "SQLite schema store" withSQLiteStore
   storeContract "in-memory typed store" withMemoryStore
@@ -883,6 +885,43 @@ outboxRuntimeContract label withStore = describe label do
       loadOutboxStatus store deliveryId
         `shouldReturn` Right
           (Just (OutboxDeadLettered OutboxRetriesExhausted))
+
+
+outboxJobContract
+  :: forall backend
+   . ( Eq (BackendError backend)
+     , JobStore backend
+     , ReactorStore backend
+     , Show (BackendError backend)
+     )
+  => [Char]
+  -> (forall result. (backend -> IO result) -> IO result)
+  -> Spec
+outboxJobContract label withStore = describe label do
+  it "delivers a typed outbox job into the durable job runtime" $
+    withStore \store -> do
+      invocations <- newIORef []
+      let job = ProbeJob SubmitSucceeds ReconcileAsNotSubmitted
+          entry = jobOutboxEntry deliveryId job
+          runtime =
+            mkOutboxRuntime store outboxAttemptLimit outboxRetrySchedule
+          jobRuntime = mkJobRuntime store testAttemptLimit retrySchedule
+          deliveredJobId =
+            fromMaybe (panic "invalid delivered job id") (mkJobId "delivery-1")
+      advanceReactor
+        store
+        (reactorUpdate accountReactorName (EventOffset 1) (Just entry))
+        `shouldReturn` Right ReactorCommitted
+      runOutboxOnce runtime deliveryId firstOutboxLease (deliverOutboxJob store)
+        `shouldReturn` Right DeliverySucceeded
+      runJobOnce
+        (Proxy @ProbeJob)
+        jobRuntime
+        (ProbeInput invocations)
+        deliveredJobId
+        firstLease
+        `shouldReturn` Right (JobSucceeded "submitted")
+      readIORef invocations `shouldReturn` [SubmitInvoked]
 
 
 storeContract

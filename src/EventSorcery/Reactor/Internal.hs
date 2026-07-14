@@ -8,6 +8,7 @@ module EventSorcery.Reactor.Internal (
   OutboxDeliveryResult (..),
   OutboxError (..),
   OutboxInstant (..),
+  OutboxJobError (..),
   OutboxLeaseToken (..),
   OutboxLeaseWindow (..),
   OutboxPayload (..),
@@ -34,6 +35,7 @@ module EventSorcery.Reactor.Internal (
 
 import EventSorcery.Aggregate
 import EventSorcery.Delivery.Internal
+import EventSorcery.Job.Internal
 import EventSorcery.Store.Internal
 import EventSorcery.Stream
 import Protolude
@@ -151,6 +153,20 @@ data OutboxError backend
   | OutboxLeaseTokenExhausted DeliveryId
   | OutboxAttemptExhausted DeliveryId
   | OutboxBackendFailed (BackendError backend)
+
+
+data OutboxJobError backend
+  = OutboxExpectedJobDispatch DeliveryId
+  | OutboxInvalidJobIdentifier DeliveryId
+  | OutboxJobEnqueueFailed (JobError backend)
+
+
+deriving stock instance
+  Eq (BackendError backend) => Eq (OutboxJobError backend)
+
+
+deriving stock instance
+  Show (BackendError backend) => Show (OutboxJobError backend)
 
 
 deriving stock instance
