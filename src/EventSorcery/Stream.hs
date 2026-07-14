@@ -10,6 +10,7 @@ module EventSorcery.Stream (
   StreamPosition (..),
   StreamVersion (..),
   replay,
+  resume,
   streamKey,
   streamKeyParts,
 ) where
@@ -102,6 +103,23 @@ replay
   -> Either (ReplayError entity) (Maybe entity)
 replay key events =
   fst <$> foldM (replayEvent key) (Nothing, StreamPosition 1) events
+
+
+resume
+  :: forall entity
+   . EventSourced entity
+  => StreamKey entity
+  -> StreamVersion
+  -> entity
+  -> [StoredEvent]
+  -> Either (ReplayError entity) entity
+resume key (StreamVersion version) entity events =
+  fromMaybe entity
+    . fst
+    <$> foldM
+      (replayEvent key)
+      (Just entity, StreamPosition (version + 1))
+      events
 
 
 replayEvent

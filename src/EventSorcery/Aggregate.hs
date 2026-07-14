@@ -81,6 +81,8 @@ class EventSourced entity where
   schemaVersion :: Proxy entity -> SchemaVersion
   encodeEvent :: Event entity -> ByteString
   decodeEvent :: ByteString -> Either DecodeCause (Event entity)
+  encodeSnapshot :: entity -> ByteString
+  decodeSnapshot :: ByteString -> Either DecodeCause entity
   originate :: Event entity -> Either (ApplyError entity) entity
   evolve :: entity -> Event entity -> Either (ApplyError entity) entity
   initialize :: Command entity -> Either (CommandError entity) (Effect entity)

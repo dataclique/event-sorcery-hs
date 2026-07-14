@@ -21,7 +21,7 @@ import Database.SQLite.Simple (
   withImmediateTransaction,
  )
 import Database.SQLite.Simple.FromRow (FromRow (..), field)
-import EventSorcery.Aggregate (EventVersion (..))
+import EventSorcery.Aggregate (EventVersion (..), SchemaVersion (..))
 import EventSorcery.Aggregate qualified as Aggregate
 import EventSorcery.Delivery.Internal
 import EventSorcery.Job.Internal
@@ -39,6 +39,8 @@ data SQLiteError
   = SQLiteOpenFailed SQLiteFailure
   | SQLiteReadFailed SQLiteFailure
   | SQLiteCommitFailed SQLiteFailure
+  | SQLiteStoredDataInvalid
+  | SQLiteSnapshotVersionInvalid
   deriving stock (Eq, Show)
 
 
@@ -65,6 +67,9 @@ data EnvelopeRow
 data ProjectionRow = ProjectionRow Word64 ByteString
 
 
+data SnapshotRow = SnapshotRow Word64 Word16 Text ByteString
+
+
 data JobRow = JobRow ByteString Text Word64 (Maybe Word64) Word64
 
 
@@ -89,6 +94,10 @@ instance FromRow EnvelopeRow where
 
 instance FromRow ProjectionRow where
   fromRow = ProjectionRow <$> field <*> field
+
+
+instance FromRow SnapshotRow where
+  fromRow = SnapshotRow <$> field <*> field <*> field <*> field
 
 
 instance FromRow JobRow where
@@ -126,109 +135,143 @@ instance EventStore SQLiteStore where
     pure (first SQLiteReadFailed loaded)
 
 
-  streamEventsAfter (SQLiteStore connection) = streamRows connection
+  loadStreamAfter (SQLiteStore connection _) streamIdentity version = do
+    loaded <- trySQLite (loadRowsAfter connection streamIdentity version)
+    pure (first SQLiteReadFailed loaded)
+
+
+  loadSnapshot (SQLiteStore connection _) streamIdentity = do
+    loaded <- trySQLite (loadSQLiteSnapshot connection streamIdentity)
+    pure case loaded of
+      Left failure -> Left (SQLiteReadFailed failure)
+      Right decoded -> decoded
+
+
+  discardSnapshot store@(SQLiteStore connection _) (StreamIdentity aggregateName identifier) = do
+    discarded <-
+      trySQLite
+        ( withSQLiteWrite
+            store
+            ( execute
+                connection
+                "DELETE FROM snapshots WHERE aggregate_type = ? AND aggregate_id = ?"
+                (aggregateName, identifier)
+            )
+        )
+    pure (first SQLiteCommitFailed discarded)
+
+
+  storeSnapshot = storeSQLiteSnapshot
+
+
+  streamEventsAfter (SQLiteStore connection _) = streamRows connection
 
 
   commit = commitSQLite
 
 
 instance ProjectionStore SQLiteStore where
-  loadProjection (SQLiteStore connection) name = do
-    loaded <- try @SQLError (loadProjectionState connection name)
-    pure (first (const SQLiteReadFailed) loaded)
+  loadProjection (SQLiteStore connection _) name = do
+    loaded <- trySQLite (loadProjectionState connection name)
+    pure (first SQLiteReadFailed loaded)
 
 
-  advanceProjection (SQLiteStore connection) update =
+  advanceProjection store@(SQLiteStore connection _) update =
     case consumeProjectionUpdate update of
       Unrestricted (name, offset, view) -> do
         advanced <-
-          try @SQLError
-            ( withTransaction
-                connection
+          trySQLite
+            ( withSQLiteTransaction
+                store
                 (advanceProjectionTransaction connection name offset view)
             )
         pure case advanced of
-          Left _ -> Left (ProjectionBackendFailed SQLiteCommitFailed)
+          Left failure ->
+            Left (ProjectionBackendFailed (SQLiteCommitFailed failure))
           Right result -> result
 
 
-  resetProjection (SQLiteStore connection) (ProjectionName name) = do
+  resetProjection store@(SQLiteStore connection _) (ProjectionName name) = do
     reset <-
-      try @SQLError
-        (execute connection "DELETE FROM projections WHERE name = ?" (Only name))
-    pure (first (const SQLiteCommitFailed) reset)
+      trySQLite
+        ( withSQLiteWrite
+            store
+            (execute connection "DELETE FROM projections WHERE name = ?" (Only name))
+        )
+    pure (first SQLiteCommitFailed reset)
 
 
 instance DeliveryStore SQLiteStore where
-  commitDelivery (SQLiteStore connection) delivery batch =
+  commitDelivery store@(SQLiteStore connection _) delivery batch =
     case consumeCommitBatch batch of
       Unrestricted appends -> do
         committed <-
-          try @SQLError
-            ( withTransaction
-                connection
+          trySQLite
+            ( withSQLiteTransaction
+                store
                 (commitDeliveryTransaction connection delivery appends)
             )
         pure case committed of
-          Left _ -> Left (BackendFailed SQLiteCommitFailed)
+          Left failure -> Left (BackendFailed (SQLiteCommitFailed failure))
           Right result -> result
 
 
 instance JobStore SQLiteStore where
-  enqueueJob (SQLiteStore connection) identifier payload = do
+  enqueueJob store@(SQLiteStore connection _) identifier payload = do
     enqueued <-
-      try @SQLError
-        ( withTransaction
-            connection
+      trySQLite
+        ( withSQLiteTransaction
+            store
             (enqueueJobTransaction connection identifier payload)
         )
-    pure (either (const backendJobFailure) identity enqueued)
+    pure (sqliteJobResult enqueued)
 
 
-  claimJob (SQLiteStore connection) identifier window = do
+  claimJob store@(SQLiteStore connection _) identifier window = do
     claimed <-
-      try @SQLError
-        ( withTransaction
-            connection
+      trySQLite
+        ( withSQLiteTransaction
+            store
             (claimJobTransaction connection identifier window)
         )
-    pure (either (const backendJobFailure) identity claimed)
+    pure (sqliteJobResult claimed)
 
 
-  acknowledgeJob (SQLiteStore connection) identifier token = do
+  acknowledgeJob store@(SQLiteStore connection _) identifier token = do
     acknowledged <-
-      try @SQLError
-        ( withTransaction
-            connection
+      trySQLite
+        ( withSQLiteTransaction
+            store
             (acknowledgeJobTransaction connection identifier token)
         )
-    pure (either (const backendJobFailure) identity acknowledged)
+    pure (sqliteJobResult acknowledged)
 
 
 instance ReactorStore SQLiteStore where
-  loadReactorCheckpoint (SQLiteStore connection) name = do
-    loaded <- try @SQLError (loadSQLiteReactorCheckpoint connection name)
-    pure (first (const SQLiteReadFailed) loaded)
+  loadReactorCheckpoint (SQLiteStore connection _) name = do
+    loaded <- trySQLite (loadSQLiteReactorCheckpoint connection name)
+    pure (first SQLiteReadFailed loaded)
 
 
-  loadOutboxEntry (SQLiteStore connection) identifier = do
-    loaded <- try @SQLError (loadSQLiteOutboxEntry connection identifier)
+  loadOutboxEntry (SQLiteStore connection _) identifier = do
+    loaded <- trySQLite (loadSQLiteOutboxEntry connection identifier)
     pure case loaded of
-      Left _ -> Left SQLiteReadFailed
+      Left failure -> Left (SQLiteReadFailed failure)
       Right decoded -> decoded
 
 
-  advanceReactor (SQLiteStore connection) update =
+  advanceReactor store@(SQLiteStore connection _) update =
     case consumeReactorUpdate update of
       Unrestricted (name, offset, proposed) -> do
         advanced <-
-          try @SQLError
-            ( withTransaction
-                connection
+          trySQLite
+            ( withSQLiteTransaction
+                store
                 (advanceReactorTransaction connection name offset proposed)
             )
         pure case advanced of
-          Left _ -> Left (ReactorBackendFailed SQLiteCommitFailed)
+          Left failure ->
+            Left (ReactorBackendFailed (SQLiteCommitFailed failure))
           Right result -> result
 
 
@@ -339,6 +382,19 @@ migrate connection = do
       view BLOB NOT NULL
     )
     """
+  execute_
+    connection
+    """
+    CREATE TABLE IF NOT EXISTS snapshots (
+      aggregate_type TEXT NOT NULL,
+      aggregate_id TEXT NOT NULL,
+      sequence INTEGER NOT NULL,
+      schema_version INTEGER NOT NULL,
+      history TEXT NOT NULL,
+      payload BLOB NOT NULL,
+      PRIMARY KEY (aggregate_type, aggregate_id)
+    )
+    """
 
 
 loadRows :: Connection -> StreamIdentity -> IO [StoredEvent]
@@ -362,6 +418,145 @@ loadRows connection (StreamIdentity aggregateName identifier) = do
         payload
 
 
+loadRowsAfter
+  :: Connection -> StreamIdentity -> StreamVersion -> IO [StoredEvent]
+loadRowsAfter
+  connection
+  (StreamIdentity aggregateName identifier)
+  (StreamVersion version) = do
+    rows <-
+      query
+        connection
+        """
+        SELECT sequence, event_type, event_version, payload
+        FROM events
+        WHERE aggregate_type = ? AND aggregate_id = ? AND sequence > ?
+        ORDER BY sequence
+        """
+        (aggregateName, identifier, version)
+    pure (toStored <$> rows)
+    where
+      toStored (EventRow position eventName eventSchema payload) =
+        StoredEvent
+          (StreamPosition position)
+          ( EventMetadata
+              aggregateName
+              identifier
+              eventName
+              (EventVersion eventSchema)
+          )
+          payload
+
+
+loadSQLiteSnapshot
+  :: Connection
+  -> StreamIdentity
+  -> IO (Either SQLiteError (Maybe StoredSnapshot))
+loadSQLiteSnapshot
+  connection
+  (StreamIdentity aggregateName identifier) = do
+    rows <-
+      query
+        connection
+        """
+        SELECT sequence, schema_version, history, payload
+        FROM snapshots
+        WHERE aggregate_type = ? AND aggregate_id = ?
+        """
+        (aggregateName, identifier)
+    pure case rows of
+      row : _ -> Just <$> decodeSnapshotRow row
+      [] -> Right Nothing
+
+
+decodeSnapshotRow :: SnapshotRow -> Either SQLiteError StoredSnapshot
+decodeSnapshotRow (SnapshotRow version schema history payload) = do
+  decodedHistory <- case history of
+    "retained" -> Right RetainedHistory
+    "compacted" -> Right CompactedHistory
+    _ -> Left SQLiteStoredDataInvalid
+  pure
+    ( StoredSnapshot
+        (StreamVersion version)
+        (SchemaVersion schema)
+        decodedHistory
+        payload
+    )
+
+
+storeSQLiteSnapshot
+  :: SQLiteStore
+  -> SnapshotWrite
+  %1 -> IO (Either SQLiteError ())
+storeSQLiteSnapshot store@(SQLiteStore connection _) write =
+  case consumeSnapshotWrite write of
+    Unrestricted snapshot -> do
+      stored <-
+        trySQLite
+          ( withSQLiteTransaction
+              store
+              (storeSnapshotTransaction connection snapshot)
+          )
+      pure case stored of
+        Left failure -> Left (SQLiteCommitFailed failure)
+        Right True -> Right ()
+        Right False -> Left SQLiteSnapshotVersionInvalid
+
+
+storeSnapshotTransaction
+  :: Connection -> (StreamIdentity, StoredSnapshot) -> IO Bool
+storeSnapshotTransaction connection (streamIdentity, snapshot) = do
+  actual <- currentSQLiteVersion connection streamIdentity
+  if snapshotWithinVersion snapshot actual
+    then insertSnapshot connection streamIdentity snapshot $> True
+    else pure False
+
+
+snapshotWithinVersion :: StoredSnapshot -> ExpectedVersion -> Bool
+snapshotWithinVersion _ NoStream = False
+snapshotWithinVersion
+  (StoredSnapshot proposed _ _ _)
+  (At actual) = proposed <= actual
+
+
+insertSnapshot :: Connection -> StreamIdentity -> StoredSnapshot -> IO ()
+insertSnapshot
+  connection
+  (StreamIdentity aggregateName identifier)
+  (StoredSnapshot (StreamVersion version) (SchemaVersion schema) history payload) =
+    execute
+      connection
+      """
+      INSERT INTO snapshots (
+        aggregate_type,
+        aggregate_id,
+        sequence,
+        schema_version,
+        history,
+        payload
+      )
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT (aggregate_type, aggregate_id) DO UPDATE SET
+        sequence = excluded.sequence,
+        schema_version = excluded.schema_version,
+        history = excluded.history,
+        payload = excluded.payload
+      WHERE excluded.sequence >= snapshots.sequence
+      """
+      ( aggregateName
+      , identifier
+      , version
+      , schema
+      , snapshotHistoryText history
+      , payload
+      )
+
+
+snapshotHistoryText :: SnapshotHistory -> Text
+snapshotHistoryText RetainedHistory = "retained"
+snapshotHistoryText CompactedHistory = "compacted"
+
+
 streamRows
   :: Connection
   -> EventOffset
@@ -371,8 +566,8 @@ streamRows
        (ExceptT SQLiteError IO)
        ()
 streamRows connection offset = do
-  loaded <- liftIO (try @SQLError (loadEnvelopeRows connection offset))
-  rows <- either (const (throwError SQLiteReadFailed)) pure loaded
+  loaded <- liftIO (trySQLite (loadEnvelopeRows connection offset))
+  rows <- either (throwError . SQLiteReadFailed) pure loaded
   case NonEmpty.nonEmpty rows of
     Nothing -> pure ()
     Just page -> do
@@ -546,7 +741,7 @@ decodeJobRow (JobRow payload status token expires attempts) = do
     ("ready", Nothing) -> Right JobReady
     ("leased", Just expiresAt) -> Right (JobLeased (LeaseInstant expiresAt))
     ("completed", Nothing) -> Right JobCompleted
-    _ -> Left (JobBackendFailed SQLiteReadFailed)
+    _ -> Left (JobBackendFailed SQLiteStoredDataInvalid)
   pure
     ( JobRecord
         payload
@@ -603,8 +798,11 @@ leaseExpiry status = case status of
   JobCompleted -> Nothing
 
 
-backendJobFailure :: Either (JobError SQLiteStore) result
-backendJobFailure = Left (JobBackendFailed SQLiteCommitFailed)
+sqliteJobResult
+  :: Either SQLiteFailure (Either (JobError SQLiteStore) result)
+  -> Either (JobError SQLiteStore) result
+sqliteJobResult =
+  either (Left . JobBackendFailed . SQLiteCommitFailed) identity
 
 
 advanceReactorTransaction
@@ -674,7 +872,7 @@ decodeOutboxRow :: OutboxRow -> Either SQLiteError OutboxPayload
 decodeOutboxRow (OutboxRow payloadType payload) = case payloadType of
   "command" -> Right (CommandDelivery payload)
   "job" -> Right (JobDispatch payload)
-  _ -> Left SQLiteReadFailed
+  _ -> Left SQLiteStoredDataInvalid
 
 
 storeOutboxEntry :: Connection -> OutboxEntry -> IO ()
@@ -729,11 +927,11 @@ commitDeliveryTransaction connection delivery appends = do
   if recorded
     then pure (Right DeliveryAlreadyApplied)
     else do
-      conflict <- firstConflict connection appends
-      case conflict of
-        Just found -> pure (Left found)
-        Nothing -> do
-          traverse_ (insertAppend connection) appends
+      validated <- validateAppends connection appends
+      case validated of
+        Left failure -> pure (Left failure)
+        Right validatedAppends -> do
+          traverse_ (insertValidatedAppend connection) validatedAppends
           insertDeliveryReceipt connection delivery
           pure (Right DeliveryApplied)
 

@@ -16,7 +16,18 @@ newtype AccountId = AccountId Text
 
 
 newtype Account = Account Word64
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (Aeson.FromJSON, Aeson.ToJSON)
+
+
+newtype AccountV2Id = AccountV2Id Text
+
+
+newtype AccountV2 = AccountV2 Word64
   deriving stock (Eq, Show)
+
+
+newtype AccountV2Event = AccountV2Event AccountEvent
 
 
 data AccountCommand
@@ -84,6 +95,10 @@ instance EventSourced Account where
   encodeEvent = LazyByteString.toStrict . Aeson.encode
   decodeEvent =
     first (const (DecodeCause "invalid account event")) . Aeson.eitherDecodeStrict'
+  encodeSnapshot = LazyByteString.toStrict . Aeson.encode
+  decodeSnapshot =
+    first (const (DecodeCause "invalid account snapshot"))
+      . Aeson.eitherDecodeStrict'
   originate (Opened amount) = Right (Account amount)
   originate (Deposited _) = Left DepositBeforeOpen
   originate (NotificationQueued _) = Left DepositBeforeOpen
@@ -98,6 +113,35 @@ instance EventSourced Account where
   transition _ (Deposit amount) = Right (Events (Deposited amount :| []))
   transition _ Notify = Right (Dispatch (EmailJob "owner@example.com"))
   transition _ InvalidDeposit = Right (Events (Deposited 1 :| []))
+
+
+instance EventSourced AccountV2 where
+  type EntityId AccountV2 = AccountV2Id
+  type Command AccountV2 = AccountCommand
+  type Event AccountV2 = AccountV2Event
+  type CommandError AccountV2 = AccountCommandError
+  type ApplyError AccountV2 = AccountApplyError
+  type Jobs AccountV2 = '[]
+
+
+  aggregateType _ = "account"
+  encodeEntityId (AccountV2Id identifier) = identifier
+  eventType (AccountV2Event event) = Aggregate.eventType @Account event
+  eventVersion (AccountV2Event event) = Aggregate.eventVersion @Account event
+  schemaVersion _ = SchemaVersion 2
+  encodeEvent (AccountV2Event event) = encodeEvent @Account event
+  decodeEvent = fmap AccountV2Event . decodeEvent @Account
+  encodeSnapshot (AccountV2 balance) =
+    LazyByteString.toStrict (Aeson.encode balance)
+  decodeSnapshot bytes =
+    first
+      (const (DecodeCause "invalid account v2 snapshot"))
+      (AccountV2 <$> Aeson.eitherDecodeStrict' bytes)
+  originate (AccountV2Event event) = toV2 <$> originate @Account event
+  evolve (AccountV2 balance) (AccountV2Event event) =
+    toV2 <$> evolve @Account (Account balance) event
+  initialize _ = Left AlreadyOpen
+  transition _ _ = Left AlreadyOpen
 
 
 main :: IO ()
@@ -167,6 +211,8 @@ main = hspec do
   reactorStoreContract "SQLite reactor store" withSQLiteStore
   storeContract "in-memory typed store" withMemoryStore
   storeContract "SQLite typed store" withSQLiteStore
+  snapshotContract "in-memory snapshots" withMemoryStore
+  snapshotContract "SQLite snapshots" withSQLiteStore
 
 
 eventStoreContract
@@ -548,6 +594,64 @@ storeContract label withBackend = describe label do
       length <$> origin `shouldBe` Right 2
 
 
+snapshotContract
+  :: forall backend
+   . ( Eq (BackendError backend)
+     , EventStore backend
+     , Show (BackendError backend)
+     )
+  => [Char]
+  -> (forall result. (backend -> IO result) -> IO result)
+  -> Spec
+snapshotContract label withBackend = describe label do
+  it "stores a compatible snapshot and resumes from later events" $
+    withBackend \backend -> do
+      let store = mkStore backend testLimits (pure jobId)
+      executeCommand store accountKey (Open 10)
+        `shouldReturn` Right (Account 10)
+      executeCommand store accountKey (Deposit 5)
+        `shouldReturn` Right (Account 15)
+      snapshotEntity store accountKey RetainedHistory
+        `shouldReturn` Right (Just (Account 15))
+      loadedSnapshot <- loadSnapshot backend accountIdentity
+      fmap (fmap snapshotStreamVersion) loadedSnapshot
+        `shouldBe` Right (Just (StreamVersion 2))
+      executeCommand store accountKey (Deposit 5)
+        `shouldReturn` Right (Account 20)
+      loadEntity store accountKey `shouldReturn` Right (Just (Account 20))
+
+  it "ignores an incompatible retained snapshot and replays events" $
+    withBackend \backend -> do
+      let store = mkStore backend testLimits (pure jobId)
+          upgradedStore = mkStore backend testLimits (pure jobId)
+      executeCommand store accountKey (Open 10)
+        `shouldReturn` Right (Account 10)
+      executeCommand store accountKey (Deposit 5)
+        `shouldReturn` Right (Account 15)
+      snapshotEntity store accountKey RetainedHistory
+        `shouldReturn` Right (Just (Account 15))
+      loadEntity upgradedStore accountV2Key
+        `shouldReturn` Right (Just (AccountV2 15))
+      discarded <- loadSnapshot backend accountIdentity
+      fmap (fmap snapshotStreamVersion) discarded `shouldBe` Right Nothing
+
+  it "fails closed for an incompatible compacted snapshot" $
+    withBackend \backend -> do
+      let store = mkStore backend testLimits (pure jobId)
+          upgradedStore = mkStore backend testLimits (pure jobId)
+      executeCommand store accountKey (Open 10)
+        `shouldReturn` Right (Account 10)
+      snapshotEntity store accountKey CompactedHistory
+        `shouldReturn` Right (Just (Account 10))
+      loadEntity upgradedStore accountV2Key
+        `shouldReturn` Left
+          ( StoreSnapshotSchemaMismatch
+              CompactedHistory
+              (SchemaVersion 2)
+              (SchemaVersion 1)
+          )
+
+
 withMemoryStore :: (MemoryStore -> IO result) -> IO result
 withMemoryStore action = newMemoryStore >>= action
 
@@ -725,8 +829,16 @@ isDuplicateStream result = case result of
   _ -> False
 
 
+toV2 :: Account -> AccountV2
+toV2 (Account balance) = AccountV2 balance
+
+
 accountKey :: StreamKey Account
 accountKey = streamKey (AccountId "account-1")
+
+
+accountV2Key :: StreamKey AccountV2
+accountV2Key = streamKey (AccountV2Id "account-1")
 
 
 secondAccountKey :: StreamKey Account

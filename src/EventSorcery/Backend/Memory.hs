@@ -29,8 +29,9 @@ newtype MemoryStore = MemoryStore (TVar MemoryState)
 
 
 data MemoryState = MemoryState
-  { streams :: Map.Map StreamIdentity [StoredEvent]
+  { streams :: Map.Map StreamIdentity (Seq.Seq StoredEvent)
   , eventJournal :: Seq.Seq StoredEnvelope
+  , snapshots :: Map.Map StreamIdentity StoredSnapshot
   , projections :: Map.Map ProjectionName ProjectionState
   , deliveryReceipts :: Set.Set DeliveryId
   , jobs :: Map.Map JobId JobRecord
@@ -44,7 +45,8 @@ data MemoryReactorState
       (Map.Map DeliveryId OutboxEntry)
 
 
-type MemoryError = Void
+data MemoryError = MemorySnapshotVersionInvalid
+  deriving stock (Eq, Show)
 
 
 newMemoryStore :: IO MemoryStore
@@ -54,6 +56,7 @@ newMemoryStore =
       MemoryState
         { streams = Map.empty
         , eventJournal = Seq.empty
+        , snapshots = Map.empty
         , projections = Map.empty
         , deliveryReceipts = Set.empty
         , jobs = Map.empty
@@ -68,6 +71,27 @@ instance EventStore MemoryStore where
   loadStream (MemoryStore memoryState) streamIdentity = do
     current <- readTVarIO memoryState
     pure (Right (loadMemoryStream streamIdentity current))
+
+
+  loadStreamAfter (MemoryStore memoryState) streamIdentity version = do
+    current <- readTVarIO memoryState
+    pure (Right (loadMemoryStreamAfter streamIdentity version current))
+
+
+  loadSnapshot (MemoryStore memoryState) streamIdentity = do
+    current <- readTVarIO memoryState
+    pure (Right (Map.lookup streamIdentity current.snapshots))
+
+
+  discardSnapshot (MemoryStore memoryState) streamIdentity = atomically do
+    current <- readTVar memoryState
+    writeTVar
+      memoryState
+      current {snapshots = Map.delete streamIdentity current.snapshots}
+    pure (Right ())
+
+
+  storeSnapshot = storeMemorySnapshot
 
 
   streamEventsAfter (MemoryStore memoryState) offset = do
@@ -212,7 +236,66 @@ commitAppends (MemoryStore streams) appends = atomically do
 
 loadMemoryStream :: StreamIdentity -> MemoryState -> [StoredEvent]
 loadMemoryStream streamIdentity memoryState =
-  Map.findWithDefault [] streamIdentity memoryState.streams
+  toList (loadMemoryEvents streamIdentity memoryState)
+
+
+loadMemoryEvents :: StreamIdentity -> MemoryState -> Seq.Seq StoredEvent
+loadMemoryEvents streamIdentity memoryState =
+  Map.findWithDefault Seq.empty streamIdentity memoryState.streams
+
+
+loadMemoryStreamAfter
+  :: StreamIdentity -> StreamVersion -> MemoryState -> [StoredEvent]
+loadMemoryStreamAfter streamIdentity (StreamVersion version) memoryState =
+  toList
+    ( Seq.drop
+        (fromIntegral version)
+        (loadMemoryEvents streamIdentity memoryState)
+    )
+
+
+storeMemorySnapshot
+  :: MemoryStore
+  -> SnapshotWrite
+  %1 -> IO (Either MemoryError ())
+storeMemorySnapshot (MemoryStore memoryState) write =
+  case consumeSnapshotWrite write of
+    Unrestricted (streamIdentity, snapshot) -> atomically do
+      current <- readTVar memoryState
+      let stream = loadMemoryEvents streamIdentity current
+      if snapshotWithinStream snapshot stream
+        then do
+          let nextSnapshots =
+                advanceSnapshot
+                  streamIdentity
+                  snapshot
+                  current.snapshots
+          writeTVar memoryState current {snapshots = nextSnapshots}
+          pure (Right ())
+        else pure (Left MemorySnapshotVersionInvalid)
+
+
+snapshotWithinStream :: StoredSnapshot -> Seq.Seq StoredEvent -> Bool
+snapshotWithinStream (StoredSnapshot version _ _ _) events =
+  case memoryVersion events of
+    NoStream -> False
+    At actual -> version <= actual
+
+
+advanceSnapshot
+  :: StreamIdentity
+  -> StoredSnapshot
+  -> Map.Map StreamIdentity StoredSnapshot
+  -> Map.Map StreamIdentity StoredSnapshot
+advanceSnapshot streamIdentity proposed current =
+  case Map.lookup streamIdentity current of
+    Just existing
+      | snapshotVersion existing > snapshotVersion proposed -> current
+    _ -> Map.insert streamIdentity proposed current
+
+
+snapshotVersion :: StoredSnapshot -> StreamVersion
+snapshotVersion (StoredSnapshot version _ _ _) = version
 
 
 isAfter :: EventOffset -> StoredEnvelope -> Bool
@@ -220,7 +303,7 @@ isAfter offset (StoredEnvelope storedOffset _ _) = storedOffset > offset
 
 
 validateExpectedVersions
-  :: Map.Map StreamIdentity [StoredEvent]
+  :: Map.Map StreamIdentity (Seq.Seq StoredEvent)
   -> NonEmpty StreamAppend
   -> Either (CommitError MemoryStore) ()
 validateExpectedVersions streams = traverse_ validate
@@ -231,7 +314,7 @@ validateExpectedVersions streams = traverse_ validate
       where
         streamIdentity = streamAppendIdentity append
         expected = streamAppendExpectedVersion append
-        actual = currentVersion (Map.findWithDefault [] streamIdentity streams)
+        actual = memoryVersion (Map.findWithDefault Seq.empty streamIdentity streams)
 
 
 applyAppend
@@ -241,13 +324,16 @@ applyAppend
 applyAppend memoryState append =
   memoryState
     { streams =
-        Map.insert streamIdentity (existing <> storedEvents) memoryState.streams
+        Map.insert
+          streamIdentity
+          (existing <> Seq.fromList storedEvents)
+          memoryState.streams
     , eventJournal = memoryState.eventJournal <> Seq.fromList envelopes
     }
   where
     streamIdentity = streamAppendIdentity append
-    existing = Map.findWithDefault [] streamIdentity memoryState.streams
-    firstPosition = case currentVersion existing of
+    existing = Map.findWithDefault Seq.empty streamIdentity memoryState.streams
+    firstPosition = case memoryVersion existing of
       NoStream -> 1
       At (StreamVersion version) -> version + 1
     storedEvents =
@@ -265,6 +351,16 @@ applyAppend memoryState append =
         storedEvents
     toStored position (ProposedEvent metadata payload) =
       StoredEvent (StreamPosition position) metadata payload
+
+
+memoryVersion :: Seq.Seq StoredEvent -> ExpectedVersion
+memoryVersion events = case Seq.viewr events of
+  Seq.EmptyR -> NoStream
+  _ Seq.:> stored -> At (streamPositionVersion stored.position)
+
+
+streamPositionVersion :: StreamPosition -> StreamVersion
+streamPositionVersion (StreamPosition position) = StreamVersion position
 
 
 recordDelivery :: DeliveryId -> MemoryState -> MemoryState

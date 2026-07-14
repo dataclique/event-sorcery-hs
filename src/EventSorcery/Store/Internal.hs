@@ -8,6 +8,9 @@ module EventSorcery.Store.Internal (
   EventStore (..),
   PayloadLimit (..),
   ProposedEvent (..),
+  SnapshotHistory (..),
+  SnapshotWrite (..),
+  StoredSnapshot (..),
   StreamAppend (..),
   StreamIdentity (..),
   StoredEnvelope (..),
@@ -18,6 +21,7 @@ module EventSorcery.Store.Internal (
   appendEvents,
   commitBatch,
   consumeCommitBatch,
+  consumeSnapshotWrite,
   currentVersion,
   proposedEvents,
   streamAppendEvents,
@@ -56,6 +60,23 @@ newtype EventOffset = EventOffset Word64
 
 data StoredEnvelope = StoredEnvelope EventOffset StreamIdentity StoredEvent
   deriving stock (Eq, Show)
+
+
+data SnapshotHistory
+  = RetainedHistory
+  | CompactedHistory
+  deriving stock (Eq, Show)
+
+
+data StoredSnapshot
+  = StoredSnapshot StreamVersion SchemaVersion SnapshotHistory ByteString
+  deriving stock (Eq)
+
+
+data SnapshotWrite where
+  SnapshotWrite
+    :: Unrestricted (StreamIdentity, StoredSnapshot)
+    %1 -> SnapshotWrite
 
 
 data ProposedEvent = ProposedEvent EventMetadata ByteString
@@ -113,6 +134,11 @@ data StoreError backend entity
       ExpectedVersion
   | StoreBackendFailed (BackendError backend)
   | StoreCommitLimitExceeded CommitLimitViolation
+  | StoreSnapshotDecodeFailed StreamVersion DecodeCause
+  | StoreSnapshotSchemaMismatch
+      SnapshotHistory
+      SchemaVersion
+      SchemaVersion
 
 
 deriving stock instance
@@ -139,6 +165,23 @@ class EventStore backend where
     :: backend
     -> StreamIdentity
     -> IO (Either (BackendError backend) [StoredEvent])
+  loadStreamAfter
+    :: backend
+    -> StreamIdentity
+    -> StreamVersion
+    -> IO (Either (BackendError backend) [StoredEvent])
+  loadSnapshot
+    :: backend
+    -> StreamIdentity
+    -> IO (Either (BackendError backend) (Maybe StoredSnapshot))
+  discardSnapshot
+    :: backend
+    -> StreamIdentity
+    -> IO (Either (BackendError backend) ())
+  storeSnapshot
+    :: backend
+    -> SnapshotWrite
+    %1 -> IO (Either (BackendError backend) ())
   streamEventsAfter
     :: backend
     -> EventOffset
@@ -195,6 +238,11 @@ commitBatch (CommitLimits payloadLimit batchLimit) appends = do
 consumeCommitBatch
   :: CommitBatch %1 -> Unrestricted (NonEmpty StreamAppend)
 consumeCommitBatch (CommitBatch appends) = appends
+
+
+consumeSnapshotWrite
+  :: SnapshotWrite %1 -> Unrestricted (StreamIdentity, StoredSnapshot)
+consumeSnapshotWrite (SnapshotWrite snapshot) = snapshot
 
 
 currentVersion :: [StoredEvent] -> ExpectedVersion
