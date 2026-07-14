@@ -22,6 +22,7 @@ import Database.SQLite.Simple (
  )
 import Database.SQLite.Simple.FromRow (FromRow (..), field)
 import EventSorcery.Aggregate (EventVersion (..))
+import EventSorcery.Delivery.Internal
 import EventSorcery.Projection.Internal
 import EventSorcery.Store.Internal
 import EventSorcery.Stream
@@ -141,6 +142,21 @@ instance ProjectionStore SQLiteStore where
     pure (first (const SQLiteCommitFailed) reset)
 
 
+instance DeliveryStore SQLiteStore where
+  commitDelivery (SQLiteStore connection) delivery batch =
+    case consumeCommitBatch batch of
+      Unrestricted appends -> do
+        committed <-
+          try @SQLError
+            ( withTransaction
+                connection
+                (commitDeliveryTransaction connection delivery appends)
+            )
+        pure case committed of
+          Left _ -> Left (BackendFailed SQLiteCommitFailed)
+          Right result -> result
+
+
 commitSQLite
   :: SQLiteStore
   -> CommitBatch
@@ -201,6 +217,13 @@ migrate connection = do
       event_version INTEGER NOT NULL,
       payload BLOB NOT NULL,
       UNIQUE (aggregate_type, aggregate_id, sequence)
+    )
+    """
+  execute_
+    connection
+    """
+    CREATE TABLE IF NOT EXISTS delivery_receipts (
+      delivery_id TEXT PRIMARY KEY
     )
     """
   execute_
@@ -350,6 +373,50 @@ storeProjectionState
         view = excluded.view
       """
       (name, offset, view)
+
+
+commitDeliveryTransaction
+  :: Connection
+  -> DeliveryId
+  -> NonEmpty StreamAppend
+  -> IO (Either (CommitError SQLiteStore) DeliveryCommit)
+commitDeliveryTransaction connection delivery appends = do
+  recorded <- deliveryRecorded connection delivery
+  if recorded
+    then pure (Right DeliveryAlreadyApplied)
+    else do
+      conflict <- firstConflict connection appends
+      case conflict of
+        Just found -> pure (Left found)
+        Nothing -> do
+          traverse_ (insertAppend connection) appends
+          insertDeliveryReceipt connection delivery
+          pure (Right DeliveryApplied)
+
+
+deliveryRecorded :: Connection -> DeliveryId -> IO Bool
+deliveryRecorded connection (DeliveryId delivery) = do
+  rows <-
+    query
+      connection
+      """
+      SELECT 1
+      FROM delivery_receipts
+      WHERE delivery_id = ?
+      LIMIT 1
+      """
+      (Only delivery)
+  pure case rows of
+    (_ :: Only Word8) : _ -> True
+    [] -> False
+
+
+insertDeliveryReceipt :: Connection -> DeliveryId -> IO ()
+insertDeliveryReceipt connection (DeliveryId delivery) =
+  execute
+    connection
+    "INSERT INTO delivery_receipts (delivery_id) VALUES (?)"
+    (Only delivery)
 
 
 commitTransaction

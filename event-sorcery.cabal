@@ -53,11 +53,13 @@ library
     EventSorcery.Aggregate
     EventSorcery.Backend.Memory
     EventSorcery.Backend.SQLite
+    EventSorcery.Delivery
     EventSorcery.Projection
     EventSorcery.Store
     EventSorcery.Stream
 
   other-modules:
+    EventSorcery.Delivery.Internal
     EventSorcery.Projection.Internal
     EventSorcery.Store.Internal
 

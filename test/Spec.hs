@@ -122,6 +122,8 @@ main = hspec do
   eventStoreContract "SQLite event store" withSQLiteStore
   projectionStoreContract "in-memory projection store" withMemoryStore
   projectionStoreContract "SQLite projection store" withSQLiteStore
+  deliveryStoreContract "in-memory delivery store" withMemoryStore
+  deliveryStoreContract "SQLite delivery store" withSQLiteStore
 
 
 eventStoreContract
@@ -244,6 +246,57 @@ projectionStoreContract label withStore = describe label do
     loadProjection store balancesProjectionName `shouldReturn` Right Nothing
 
 
+deliveryStoreContract
+  :: forall backend
+   . ( DeliveryStore backend
+     , Eq (BackendError backend)
+     , Show (BackendError backend)
+     )
+  => [Char]
+  -> (forall result. (backend -> IO result) -> IO result)
+  -> Spec
+deliveryStoreContract label withStore = describe label do
+  it "records a receipt with target events and absorbs a repeated delivery" $
+    withStore \store -> do
+      firstBatch <- validBatch (appendEvents accountKey NoStream (Opened 10 :| []))
+      commitDelivery store deliveryId firstBatch
+        `shouldReturn` Right DeliveryApplied
+      repeatedBatch <-
+        validBatch
+          ( appendEvents
+              accountKey
+              (At (StreamVersion 1))
+              (Deposited 5 :| [])
+          )
+      commitDelivery store deliveryId repeatedBatch
+        `shouldReturn` Right DeliveryAlreadyApplied
+      loaded <- loadStream store accountIdentity
+      (replay accountKey <$> loaded)
+        `shouldBe` Right (Right (Just (Account 10)))
+
+  it "does not record a receipt when the target commit conflicts" $
+    withStore \store -> do
+      original <- validBatch (appendEvents accountKey NoStream (Opened 10 :| []))
+      commit store original `shouldReturn` Right ()
+      conflicting <-
+        validBatch (appendEvents accountKey NoStream (Deposited 5 :| []))
+      commitDelivery store deliveryId conflicting
+        `shouldReturn` Left
+          (ConcurrencyConflict accountIdentity NoStream (At (StreamVersion 1)))
+      correctedBatch <-
+        validBatch
+          ( appendEvents
+              accountKey
+              (At (StreamVersion 1))
+              (Deposited 5 :| [])
+          )
+      commitDelivery store deliveryId correctedBatch
+        `shouldReturn` Right DeliveryApplied
+      loaded <- loadStream store accountIdentity
+      (replay accountKey <$> loaded)
+        `shouldBe` Right (Right (Just (Account 15)))
+
+
 withMemoryStore :: (MemoryStore -> IO result) -> IO result
 withMemoryStore action = newMemoryStore >>= action
 
@@ -272,6 +325,11 @@ testLimits =
 balancesProjectionName :: ProjectionName
 balancesProjectionName =
   fromMaybe (panic "invalid projection name") (mkProjectionName "balances")
+
+
+deliveryId :: DeliveryId
+deliveryId =
+  fromMaybe (panic "invalid delivery id") (mkDeliveryId "delivery-1")
 
 
 firstProjectionUpdate :: ProjectionUpdate
