@@ -1,5 +1,6 @@
 dist
 dist-*
+dist-newstyle/
 cabal-dev
 *.o
 *.hi
@@ -21,3 +22,6 @@ cabal.project.local
 cabal.project.local~
 .HTF/
 .ghc.environment.*
+.direnv/
+.pre-commit-config.yaml
+result

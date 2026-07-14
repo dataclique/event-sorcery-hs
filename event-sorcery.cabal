@@ -1,0 +1,43 @@
+cabal-version:      3.0
+name:               event-sorcery
+version:            0.1.0.0
+synopsis:           Type-driven event sourcing
+description:
+  Pure, type-driven event-sourcing primitives with in-memory and SQLite
+  persistence.
+
+homepage:           https://github.com/dataclique/event-sorcery-hs
+bug-reports:        https://github.com/dataclique/event-sorcery-hs/issues
+license:            MIT
+license-file:       LICENSE
+build-type:         Simple
+category:           Database
+extra-source-files:
+  adrs/*.md
+  README.md
+
+common strict
+  default-language:   GHC2024
+  default-extensions:
+    BlockArguments
+    DeriveAnyClass
+    DerivingVia
+    DuplicateRecordFields
+    NoFieldSelectors
+    NoImplicitPrelude
+    OverloadedRecordDot
+    OverloadedStrings
+    TypeFamilyDependencies
+
+  ghc-options:
+    -Wall -Wcompat -Werror -Widentities -Wincomplete-record-updates
+    -Wincomplete-uni-patterns -Wmissing-export-lists
+    -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
+
+library
+  import:          strict
+  exposed-modules: EventSorcery
+  hs-source-dirs:  src
+  build-depends:
+    , base       >=4.18  && <5
+    , protolude  >=0.3.4 && <0.4
