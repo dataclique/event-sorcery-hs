@@ -131,6 +131,8 @@ main = hspec do
   deliveryStoreContract "SQLite delivery store" withSQLiteStore
   jobStoreContract "in-memory job store" withMemoryStore
   jobStoreContract "SQLite job store" withSQLiteStore
+  reactorStoreContract "in-memory reactor store" withMemoryStore
+  reactorStoreContract "SQLite reactor store" withSQLiteStore
 
 
 eventStoreContract
@@ -343,6 +345,57 @@ jobStoreContract label withStore = describe label do
         `shouldReturn` Left (JobAlreadyCompleted jobId)
 
 
+reactorStoreContract
+  :: forall backend
+   . ( ReactorStore backend
+     , Eq (BackendError backend)
+     , Show (BackendError backend)
+     )
+  => [Char]
+  -> (forall result. (backend -> IO result) -> IO result)
+  -> Spec
+reactorStoreContract label withStore = describe label do
+  it "stores an outbox entry with its checkpoint" $ withStore \store -> do
+    advanceReactor store firstReactorUpdate
+      `shouldReturn` Right ReactorCommitted
+    loadReactorCheckpoint store accountReactorName
+      `shouldReturn` Right (Just (EventOffset 1))
+    loadOutboxEntry store deliveryId
+      `shouldReturn` Right (Just firstOutboxEntry)
+
+  it "absorbs a repeated checkpoint without inserting another effect" $
+    withStore \store -> do
+      advanceReactor store firstReactorUpdate
+        `shouldReturn` Right ReactorCommitted
+      advanceReactor store repeatedReactorUpdate
+        `shouldReturn` Right ReactorAlreadyCommitted
+      loadOutboxEntry store secondDeliveryId `shouldReturn` Right Nothing
+
+  it "rejects a skipped checkpoint without inserting its effect" $
+    withStore \store -> do
+      advanceReactor store skippedReactorUpdate
+        `shouldReturn` Left
+          ( ReactorSequenceMismatch
+              accountReactorName
+              (EventOffset 1)
+              (EventOffset 2)
+          )
+      loadReactorCheckpoint store accountReactorName
+        `shouldReturn` Right Nothing
+      loadOutboxEntry store deliveryId `shouldReturn` Right Nothing
+
+  it "rejects delivery identity reuse without advancing the checkpoint" $
+    withStore \store -> do
+      advanceReactor store firstReactorUpdate
+        `shouldReturn` Right ReactorCommitted
+      advanceReactor store conflictingReactorUpdate
+        `shouldReturn` Left (ReactorDeliveryMismatch deliveryId)
+      loadReactorCheckpoint store secondReactorName
+        `shouldReturn` Right Nothing
+      loadOutboxEntry store deliveryId
+        `shouldReturn` Right (Just firstOutboxEntry)
+
+
 withMemoryStore :: (MemoryStore -> IO result) -> IO result
 withMemoryStore action = newMemoryStore >>= action
 
@@ -376,6 +429,51 @@ balancesProjectionName =
 deliveryId :: DeliveryId
 deliveryId =
   fromMaybe (panic "invalid delivery id") (mkDeliveryId "delivery-1")
+
+
+secondDeliveryId :: DeliveryId
+secondDeliveryId =
+  fromMaybe (panic "invalid delivery id") (mkDeliveryId "delivery-2")
+
+
+accountReactorName :: ReactorName
+accountReactorName =
+  fromMaybe (panic "invalid reactor name") (mkReactorName "accounts")
+
+
+secondReactorName :: ReactorName
+secondReactorName =
+  fromMaybe (panic "invalid reactor name") (mkReactorName "notifications")
+
+
+firstOutboxEntry :: OutboxEntry
+firstOutboxEntry = OutboxEntry deliveryId (CommandDelivery "open-account")
+
+
+firstReactorUpdate :: ReactorUpdate
+firstReactorUpdate =
+  reactorUpdate accountReactorName (EventOffset 1) (Just firstOutboxEntry)
+
+
+repeatedReactorUpdate :: ReactorUpdate
+repeatedReactorUpdate =
+  reactorUpdate
+    accountReactorName
+    (EventOffset 1)
+    (Just (OutboxEntry secondDeliveryId (JobDispatch "notify")))
+
+
+skippedReactorUpdate :: ReactorUpdate
+skippedReactorUpdate =
+  reactorUpdate accountReactorName (EventOffset 2) (Just firstOutboxEntry)
+
+
+conflictingReactorUpdate :: ReactorUpdate
+conflictingReactorUpdate =
+  reactorUpdate
+    secondReactorName
+    (EventOffset 1)
+    (Just (OutboxEntry deliveryId (CommandDelivery "different")))
 
 
 jobId :: JobId

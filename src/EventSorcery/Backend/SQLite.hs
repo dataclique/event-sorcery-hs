@@ -26,6 +26,7 @@ import EventSorcery.Aggregate qualified as Aggregate
 import EventSorcery.Delivery.Internal
 import EventSorcery.Job.Internal
 import EventSorcery.Projection.Internal
+import EventSorcery.Reactor.Internal
 import EventSorcery.Store.Internal
 import EventSorcery.Stream
 import Protolude
@@ -67,6 +68,9 @@ data ProjectionRow = ProjectionRow Word64 ByteString
 data JobRow = JobRow ByteString Text Word64 (Maybe Word64) Word64
 
 
+data OutboxRow = OutboxRow Text ByteString
+
+
 instance FromRow EventRow where
   fromRow = EventRow <$> field <*> field <*> field <*> field
 
@@ -89,6 +93,10 @@ instance FromRow ProjectionRow where
 
 instance FromRow JobRow where
   fromRow = JobRow <$> field <*> field <*> field <*> field <*> field
+
+
+instance FromRow OutboxRow where
+  fromRow = OutboxRow <$> field <*> field
 
 
 openSQLiteStore :: FilePath -> IO (Either SQLiteError SQLiteStore)
@@ -197,6 +205,33 @@ instance JobStore SQLiteStore where
     pure (either (const backendJobFailure) identity acknowledged)
 
 
+instance ReactorStore SQLiteStore where
+  loadReactorCheckpoint (SQLiteStore connection) name = do
+    loaded <- try @SQLError (loadSQLiteReactorCheckpoint connection name)
+    pure (first (const SQLiteReadFailed) loaded)
+
+
+  loadOutboxEntry (SQLiteStore connection) identifier = do
+    loaded <- try @SQLError (loadSQLiteOutboxEntry connection identifier)
+    pure case loaded of
+      Left _ -> Left SQLiteReadFailed
+      Right decoded -> decoded
+
+
+  advanceReactor (SQLiteStore connection) update =
+    case consumeReactorUpdate update of
+      Unrestricted (name, offset, proposed) -> do
+        advanced <-
+          try @SQLError
+            ( withTransaction
+                connection
+                (advanceReactorTransaction connection name offset proposed)
+            )
+        pure case advanced of
+          Left _ -> Left (ReactorBackendFailed SQLiteCommitFailed)
+          Right result -> result
+
+
 commitSQLite
   :: SQLiteStore
   -> CommitBatch
@@ -257,6 +292,23 @@ migrate connection = do
       event_version INTEGER NOT NULL,
       payload BLOB NOT NULL,
       UNIQUE (aggregate_type, aggregate_id, sequence)
+    )
+    """
+  execute_
+    connection
+    """
+    CREATE TABLE IF NOT EXISTS reactors (
+      name TEXT PRIMARY KEY,
+      event_offset INTEGER NOT NULL
+    )
+    """
+  execute_
+    connection
+    """
+    CREATE TABLE IF NOT EXISTS outbox (
+      delivery_id TEXT PRIMARY KEY,
+      payload_type TEXT NOT NULL,
+      payload BLOB NOT NULL
     )
     """
   execute_
@@ -553,6 +605,118 @@ leaseExpiry status = case status of
 
 backendJobFailure :: Either (JobError SQLiteStore) result
 backendJobFailure = Left (JobBackendFailed SQLiteCommitFailed)
+
+
+advanceReactorTransaction
+  :: Connection
+  -> ReactorName
+  -> EventOffset
+  -> Maybe OutboxEntry
+  -> IO (Either (ReactorError SQLiteStore) ReactorCommit)
+advanceReactorTransaction connection name offset proposed = do
+  checkpoint <- loadSQLiteReactorCheckpoint connection name
+  existing <- loadProposedOutbox connection proposed
+  case existing >>= decideReactorAdvance name offset proposed checkpoint of
+    Left failure -> pure (Left failure)
+    Right (result, nextCheckpoint, insertion) -> do
+      traverse_ (storeOutboxEntry connection) insertion
+      traverse_ (storeReactorCheckpoint connection name) nextCheckpoint
+      pure (Right result)
+
+
+loadSQLiteReactorCheckpoint
+  :: Connection -> ReactorName -> IO (Maybe EventOffset)
+loadSQLiteReactorCheckpoint connection (ReactorName name) = do
+  rows <-
+    query
+      connection
+      """
+      SELECT event_offset
+      FROM reactors
+      WHERE name = ?
+      """
+      (Only name)
+  pure case rows of
+    Only offset : _ -> Just (EventOffset offset)
+    [] -> Nothing
+
+
+loadProposedOutbox
+  :: Connection
+  -> Maybe OutboxEntry
+  -> IO (Either (ReactorError SQLiteStore) (Maybe OutboxEntry))
+loadProposedOutbox _ Nothing = pure (Right Nothing)
+loadProposedOutbox connection (Just entry) =
+  first ReactorBackendFailed
+    <$> loadSQLiteOutboxEntry connection (outboxDeliveryId entry)
+
+
+loadSQLiteOutboxEntry
+  :: Connection
+  -> DeliveryId
+  -> IO (Either SQLiteError (Maybe OutboxEntry))
+loadSQLiteOutboxEntry connection identifier@(DeliveryId delivery) = do
+  rows <-
+    query
+      connection
+      """
+      SELECT payload_type, payload
+      FROM outbox
+      WHERE delivery_id = ?
+      """
+      (Only delivery)
+  pure case rows of
+    row : _ -> Just . OutboxEntry identifier <$> decodeOutboxRow row
+    [] -> Right Nothing
+
+
+decodeOutboxRow :: OutboxRow -> Either SQLiteError OutboxPayload
+decodeOutboxRow (OutboxRow payloadType payload) = case payloadType of
+  "command" -> Right (CommandDelivery payload)
+  "job" -> Right (JobDispatch payload)
+  _ -> Left SQLiteReadFailed
+
+
+storeOutboxEntry :: Connection -> OutboxEntry -> IO ()
+storeOutboxEntry
+  connection
+  (OutboxEntry (DeliveryId delivery) payload) =
+    execute
+      connection
+      """
+      INSERT INTO outbox (delivery_id, payload_type, payload)
+      VALUES (?, ?, ?)
+      """
+      (delivery, outboxPayloadType payload, outboxPayloadBytes payload)
+
+
+outboxPayloadType :: OutboxPayload -> Text
+outboxPayloadType payload = case payload of
+  CommandDelivery _ -> "command"
+  JobDispatch _ -> "job"
+
+
+outboxPayloadBytes :: OutboxPayload -> ByteString
+outboxPayloadBytes payload = case payload of
+  CommandDelivery bytes -> bytes
+  JobDispatch bytes -> bytes
+
+
+storeReactorCheckpoint
+  :: Connection -> ReactorName -> EventOffset -> IO ()
+storeReactorCheckpoint
+  connection
+  (ReactorName name)
+  (EventOffset offset) =
+    execute
+      connection
+      """
+      INSERT INTO reactors (name, event_offset)
+      VALUES (?, ?)
+      ON CONFLICT (name) DO UPDATE SET
+        event_offset = excluded.event_offset
+      """
+      (name, offset)
 
 
 commitDeliveryTransaction

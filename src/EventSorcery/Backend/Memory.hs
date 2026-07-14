@@ -19,6 +19,7 @@ import Data.Set qualified as Set
 import EventSorcery.Delivery.Internal
 import EventSorcery.Job.Internal
 import EventSorcery.Projection.Internal
+import EventSorcery.Reactor.Internal
 import EventSorcery.Store.Internal
 import EventSorcery.Stream
 import Protolude
@@ -27,13 +28,20 @@ import Protolude
 newtype MemoryStore = MemoryStore (TVar MemoryState)
 
 
-data MemoryState
-  = MemoryState
-      (Map.Map StreamIdentity [StoredEvent])
-      (Seq.Seq StoredEnvelope)
-      (Map.Map ProjectionName ProjectionState)
-      (Set.Set DeliveryId)
-      (Map.Map JobId JobRecord)
+data MemoryState = MemoryState
+  { streams :: Map.Map StreamIdentity [StoredEvent]
+  , eventJournal :: Seq.Seq StoredEnvelope
+  , projections :: Map.Map ProjectionName ProjectionState
+  , deliveryReceipts :: Set.Set DeliveryId
+  , jobs :: Map.Map JobId JobRecord
+  , reactors :: MemoryReactorState
+  }
+
+
+data MemoryReactorState
+  = MemoryReactorState
+      (Map.Map ReactorName EventOffset)
+      (Map.Map DeliveryId OutboxEntry)
 
 
 type MemoryError = Void
@@ -43,20 +51,28 @@ newMemoryStore :: IO MemoryStore
 newMemoryStore =
   MemoryStore
     <$> newTVarIO
-      (MemoryState Map.empty Seq.empty Map.empty Set.empty Map.empty)
+      MemoryState
+        { streams = Map.empty
+        , eventJournal = Seq.empty
+        , projections = Map.empty
+        , deliveryReceipts = Set.empty
+        , jobs = Map.empty
+        , reactors = MemoryReactorState Map.empty Map.empty
+        }
 
 
 instance EventStore MemoryStore where
   type BackendError MemoryStore = MemoryError
 
 
-  loadStream (MemoryStore streams) streamIdentity =
-    Right . loadMemoryStream streamIdentity <$> readTVarIO streams
+  loadStream (MemoryStore memoryState) streamIdentity = do
+    current <- readTVarIO memoryState
+    pure (Right (loadMemoryStream streamIdentity current))
 
 
   streamEventsAfter (MemoryStore memoryState) offset = do
-    MemoryState _ journal _ _ _ <- liftIO (readTVarIO memoryState)
-    Conduit.yieldMany (filter (isAfter offset) (toList journal))
+    current <- liftIO (readTVarIO memoryState)
+    Conduit.yieldMany (filter (isAfter offset) (toList current.eventJournal))
 
 
   commit = commitMemory
@@ -64,37 +80,34 @@ instance EventStore MemoryStore where
 
 instance ProjectionStore MemoryStore where
   loadProjection (MemoryStore memoryState) name = do
-    MemoryState _ _ projections _ _ <- readTVarIO memoryState
-    pure (Right (Map.lookup name projections))
+    current <- readTVarIO memoryState
+    pure (Right (Map.lookup name current.projections))
 
 
   advanceProjection (MemoryStore memoryState) update =
     case consumeProjectionUpdate update of
       Unrestricted (name, offset, view) -> atomically do
-        MemoryState streams journal projections receipts jobs <-
-          readTVar memoryState
+        current <- readTVar memoryState
         case decideProjectionAdvance
           name
           offset
           view
-          (Map.lookup name projections) of
+          (Map.lookup name current.projections) of
           Left failure -> pure (Left failure)
           Right (advance, next) -> do
             let updated = case next of
-                  Nothing -> projections
+                  Nothing -> current.projections
                   Just projectionState ->
-                    Map.insert name projectionState projections
-            writeTVar
-              memoryState
-              (MemoryState streams journal updated receipts jobs)
+                    Map.insert name projectionState current.projections
+            writeTVar memoryState current {projections = updated}
             pure (Right advance)
 
 
   resetProjection (MemoryStore memoryState) name = atomically do
-    MemoryState streams journal projections receipts jobs <- readTVar memoryState
+    current <- readTVar memoryState
     writeTVar
       memoryState
-      (MemoryState streams journal (Map.delete name projections) receipts jobs)
+      current {projections = Map.delete name current.projections}
     pure (Right ())
 
 
@@ -102,10 +115,10 @@ instance DeliveryStore MemoryStore where
   commitDelivery (MemoryStore memoryState) delivery batch =
     case consumeCommitBatch batch of
       Unrestricted appends -> atomically do
-        current@(MemoryState streams _ _ receipts _) <- readTVar memoryState
-        if Set.member delivery receipts
+        current <- readTVar memoryState
+        if Set.member delivery current.deliveryReceipts
           then pure (Right DeliveryAlreadyApplied)
-          else case validateExpectedVersions streams appends of
+          else case validateExpectedVersions current.streams appends of
             Left conflict -> pure (Left conflict)
             Right () -> do
               let committed = foldl' applyAppend current appends
@@ -115,8 +128,8 @@ instance DeliveryStore MemoryStore where
 
 instance JobStore MemoryStore where
   enqueueJob (MemoryStore memoryState) identifier payload = atomically do
-    current@(MemoryState _ _ _ _ jobs) <- readTVar memoryState
-    case decideEnqueue identifier payload (Map.lookup identifier jobs) of
+    current <- readTVar memoryState
+    case decideEnqueue identifier payload (Map.lookup identifier current.jobs) of
       Left failure -> pure (Left failure)
       Right (result, next) -> do
         traverse_ (writeJob memoryState current identifier) next
@@ -124,8 +137,8 @@ instance JobStore MemoryStore where
 
 
   claimJob (MemoryStore memoryState) identifier window = atomically do
-    current@(MemoryState _ _ _ _ jobs) <- readTVar memoryState
-    case decideClaim identifier window (Map.lookup identifier jobs) of
+    current <- readTVar memoryState
+    case decideClaim identifier window (Map.lookup identifier current.jobs) of
       Left failure -> pure (Left failure)
       Right (claim, next) -> do
         writeJob memoryState current identifier next
@@ -133,12 +146,47 @@ instance JobStore MemoryStore where
 
 
   acknowledgeJob (MemoryStore memoryState) identifier token = atomically do
-    current@(MemoryState _ _ _ _ jobs) <- readTVar memoryState
-    case decideAcknowledge identifier token (Map.lookup identifier jobs) of
+    current <- readTVar memoryState
+    case decideAcknowledge identifier token (Map.lookup identifier current.jobs) of
       Left failure -> pure (Left failure)
       Right next -> do
         writeJob memoryState current identifier next
         pure (Right ())
+
+
+instance ReactorStore MemoryStore where
+  loadReactorCheckpoint (MemoryStore memoryState) name = do
+    current <- readTVarIO memoryState
+    let MemoryReactorState checkpoints _ = current.reactors
+    pure (Right (Map.lookup name checkpoints))
+
+
+  loadOutboxEntry (MemoryStore memoryState) identifier = do
+    current <- readTVarIO memoryState
+    let MemoryReactorState _ outbox = current.reactors
+    pure (Right (Map.lookup identifier outbox))
+
+
+  advanceReactor (MemoryStore memoryState) update =
+    case consumeReactorUpdate update of
+      Unrestricted (name, offset, proposed) -> atomically do
+        current <- readTVar memoryState
+        let reactorState = current.reactors
+        let MemoryReactorState checkpoints outbox = reactorState
+            checkpoint = Map.lookup name checkpoints
+            existing =
+              proposed >>= \entry -> Map.lookup (outboxDeliveryId entry) outbox
+        case decideReactorAdvance name offset proposed checkpoint existing of
+          Left failure -> pure (Left failure)
+          Right (result, nextCheckpoint, insertion) -> do
+            let nextReactorState =
+                  updateMemoryReactor
+                    name
+                    nextCheckpoint
+                    insertion
+                    reactorState
+            writeTVar memoryState (setMemoryReactor nextReactorState current)
+            pure (Right result)
 
 
 commitMemory
@@ -154,8 +202,8 @@ commitAppends
   -> NonEmpty StreamAppend
   -> IO (Either (CommitError MemoryStore) ())
 commitAppends (MemoryStore streams) appends = atomically do
-  memoryState@(MemoryState stored _ _ _ _) <- readTVar streams
-  case validateExpectedVersions stored appends of
+  memoryState <- readTVar streams
+  case validateExpectedVersions memoryState.streams appends of
     Left conflict -> pure (Left conflict)
     Right () -> do
       writeTVar streams (foldl' applyAppend memoryState appends)
@@ -163,8 +211,8 @@ commitAppends (MemoryStore streams) appends = atomically do
 
 
 loadMemoryStream :: StreamIdentity -> MemoryState -> [StoredEvent]
-loadMemoryStream streamIdentity (MemoryState streams _ _ _ _) =
-  Map.findWithDefault [] streamIdentity streams
+loadMemoryStream streamIdentity memoryState =
+  Map.findWithDefault [] streamIdentity memoryState.streams
 
 
 isAfter :: EventOffset -> StoredEnvelope -> Bool
@@ -190,16 +238,15 @@ applyAppend
   :: MemoryState
   -> StreamAppend
   -> MemoryState
-applyAppend (MemoryState streams journal projections receipts jobs) append =
-  MemoryState
-    (Map.insert streamIdentity (existing <> storedEvents) streams)
-    (journal <> Seq.fromList envelopes)
-    projections
-    receipts
-    jobs
+applyAppend memoryState append =
+  memoryState
+    { streams =
+        Map.insert streamIdentity (existing <> storedEvents) memoryState.streams
+    , eventJournal = memoryState.eventJournal <> Seq.fromList envelopes
+    }
   where
     streamIdentity = streamAppendIdentity append
-    existing = Map.findWithDefault [] streamIdentity streams
+    existing = Map.findWithDefault [] streamIdentity memoryState.streams
     firstPosition = case currentVersion existing of
       NoStream -> 1
       At (StreamVersion version) -> version + 1
@@ -208,7 +255,7 @@ applyAppend (MemoryState streams journal projections receipts jobs) append =
         toStored
         [firstPosition ..]
         (NonEmpty.toList (streamAppendEvents append))
-    firstOffset = fromIntegral (Seq.length journal) + 1
+    firstOffset = fromIntegral (Seq.length memoryState.eventJournal) + 1
     envelopes =
       zipWith
         ( \offset event ->
@@ -221,13 +268,10 @@ applyAppend (MemoryState streams journal projections receipts jobs) append =
 
 
 recordDelivery :: DeliveryId -> MemoryState -> MemoryState
-recordDelivery delivery (MemoryState streams journal projections receipts jobs) =
-  MemoryState
-    streams
-    journal
-    projections
-    (Set.insert delivery receipts)
-    jobs
+recordDelivery delivery memoryState =
+  memoryState
+    { deliveryReceipts = Set.insert delivery memoryState.deliveryReceipts
+    }
 
 
 writeJob
@@ -238,15 +282,36 @@ writeJob
   -> STM ()
 writeJob
   memoryState
-  (MemoryState streams journal projections receipts jobs)
+  current
   identifier
   record =
     writeTVar
       memoryState
-      ( MemoryState
-          streams
-          journal
-          projections
-          receipts
-          (Map.insert identifier record jobs)
+      current {jobs = Map.insert identifier record current.jobs}
+
+
+updateMemoryReactor
+  :: ReactorName
+  -> Maybe EventOffset
+  -> Maybe OutboxEntry
+  -> MemoryReactorState
+  -> MemoryReactorState
+updateMemoryReactor
+  name
+  checkpoint
+  insertion
+  (MemoryReactorState checkpoints outbox) =
+    MemoryReactorState
+      (maybe checkpoints (\offset -> Map.insert name offset checkpoints) checkpoint)
+      ( maybe
+          outbox
+          (\entry -> Map.insert (outboxDeliveryId entry) entry outbox)
+          insertion
       )
+
+
+setMemoryReactor :: MemoryReactorState -> MemoryState -> MemoryState
+setMemoryReactor
+  reactors
+  memoryState =
+    memoryState {reactors = reactors}
