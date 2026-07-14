@@ -28,7 +28,6 @@
           src = self;
           hooks = {
             cabal-fmt.enable = true;
-            end-of-file-fixer.enable = true;
             fourmolu.enable = true;
             hlint.enable = true;
             nixfmt.enable = true;
