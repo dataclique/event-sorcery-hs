@@ -22,7 +22,9 @@ import Database.SQLite.Simple (
  )
 import Database.SQLite.Simple.FromRow (FromRow (..), field)
 import EventSorcery.Aggregate (EventVersion (..))
+import EventSorcery.Aggregate qualified as Aggregate
 import EventSorcery.Delivery.Internal
+import EventSorcery.Job.Internal
 import EventSorcery.Projection.Internal
 import EventSorcery.Store.Internal
 import EventSorcery.Stream
@@ -62,6 +64,9 @@ data EnvelopeRow
 data ProjectionRow = ProjectionRow Word64 ByteString
 
 
+data JobRow = JobRow ByteString Text Word64 (Maybe Word64) Word64
+
+
 instance FromRow EventRow where
   fromRow = EventRow <$> field <*> field <*> field <*> field
 
@@ -80,6 +85,10 @@ instance FromRow EnvelopeRow where
 
 instance FromRow ProjectionRow where
   fromRow = ProjectionRow <$> field <*> field
+
+
+instance FromRow JobRow where
+  fromRow = JobRow <$> field <*> field <*> field <*> field <*> field
 
 
 openSQLiteStore :: FilePath -> IO (Either SQLiteError SQLiteStore)
@@ -157,6 +166,37 @@ instance DeliveryStore SQLiteStore where
           Right result -> result
 
 
+instance JobStore SQLiteStore where
+  enqueueJob (SQLiteStore connection) identifier payload = do
+    enqueued <-
+      try @SQLError
+        ( withTransaction
+            connection
+            (enqueueJobTransaction connection identifier payload)
+        )
+    pure (either (const backendJobFailure) identity enqueued)
+
+
+  claimJob (SQLiteStore connection) identifier window = do
+    claimed <-
+      try @SQLError
+        ( withTransaction
+            connection
+            (claimJobTransaction connection identifier window)
+        )
+    pure (either (const backendJobFailure) identity claimed)
+
+
+  acknowledgeJob (SQLiteStore connection) identifier token = do
+    acknowledged <-
+      try @SQLError
+        ( withTransaction
+            connection
+            (acknowledgeJobTransaction connection identifier token)
+        )
+    pure (either (const backendJobFailure) identity acknowledged)
+
+
 commitSQLite
   :: SQLiteStore
   -> CommitBatch
@@ -217,6 +257,18 @@ migrate connection = do
       event_version INTEGER NOT NULL,
       payload BLOB NOT NULL,
       UNIQUE (aggregate_type, aggregate_id, sequence)
+    )
+    """
+  execute_
+    connection
+    """
+    CREATE TABLE IF NOT EXISTS jobs (
+      job_id TEXT PRIMARY KEY,
+      payload BLOB NOT NULL,
+      status TEXT NOT NULL,
+      lease_token INTEGER NOT NULL,
+      lease_expires INTEGER,
+      attempts INTEGER NOT NULL
     )
     """
   execute_
@@ -373,6 +425,134 @@ storeProjectionState
         view = excluded.view
       """
       (name, offset, view)
+
+
+enqueueJobTransaction
+  :: Connection
+  -> JobId
+  -> ByteString
+  -> IO (Either (JobError SQLiteStore) JobEnqueue)
+enqueueJobTransaction connection identifier payload = do
+  current <- loadJobRecord connection identifier
+  case current >>= decideEnqueue identifier payload of
+    Left failure -> pure (Left failure)
+    Right (result, next) -> do
+      traverse_ (storeJobRecord connection identifier) next
+      pure (Right result)
+
+
+claimJobTransaction
+  :: Connection
+  -> JobId
+  -> LeaseWindow
+  -> IO (Either (JobError SQLiteStore) JobClaim)
+claimJobTransaction connection identifier window = do
+  current <- loadJobRecord connection identifier
+  case current >>= decideClaim identifier window of
+    Left failure -> pure (Left failure)
+    Right (claim, next) -> do
+      storeJobRecord connection identifier next
+      pure (Right claim)
+
+
+acknowledgeJobTransaction
+  :: Connection
+  -> JobId
+  -> LeaseToken
+  -> IO (Either (JobError SQLiteStore) ())
+acknowledgeJobTransaction connection identifier token = do
+  current <- loadJobRecord connection identifier
+  case current >>= decideAcknowledge identifier token of
+    Left failure -> pure (Left failure)
+    Right next -> do
+      storeJobRecord connection identifier next
+      pure (Right ())
+
+
+loadJobRecord
+  :: Connection
+  -> JobId
+  -> IO (Either (JobError SQLiteStore) (Maybe JobRecord))
+loadJobRecord connection identifier = do
+  rows <-
+    query
+      connection
+      """
+      SELECT payload, status, lease_token, lease_expires, attempts
+      FROM jobs
+      WHERE job_id = ?
+      """
+      (Only (Aggregate.jobIdText identifier))
+  pure case rows of
+    row : _ -> Just <$> decodeJobRow row
+    [] -> Right Nothing
+
+
+decodeJobRow :: JobRow -> Either (JobError SQLiteStore) JobRecord
+decodeJobRow (JobRow payload status token expires attempts) = do
+  decodedStatus <- case (status, expires) of
+    ("ready", Nothing) -> Right JobReady
+    ("leased", Just expiresAt) -> Right (JobLeased (LeaseInstant expiresAt))
+    ("completed", Nothing) -> Right JobCompleted
+    _ -> Left (JobBackendFailed SQLiteReadFailed)
+  pure
+    ( JobRecord
+        payload
+        decodedStatus
+        (LeaseToken token)
+        (AttemptCount attempts)
+    )
+
+
+storeJobRecord :: Connection -> JobId -> JobRecord -> IO ()
+storeJobRecord
+  connection
+  identifier
+  (JobRecord payload status (LeaseToken token) (AttemptCount attempts)) =
+    execute
+      connection
+      """
+      INSERT INTO jobs (
+        job_id,
+        payload,
+        status,
+        lease_token,
+        lease_expires,
+        attempts
+      )
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT (job_id) DO UPDATE SET
+        payload = excluded.payload,
+        status = excluded.status,
+        lease_token = excluded.lease_token,
+        lease_expires = excluded.lease_expires,
+        attempts = excluded.attempts
+      """
+      ( Aggregate.jobIdText identifier
+      , payload
+      , statusText status
+      , token
+      , leaseExpiry status
+      , attempts
+      )
+
+
+statusText :: JobStatus -> Text
+statusText status = case status of
+  JobReady -> "ready"
+  JobLeased _ -> "leased"
+  JobCompleted -> "completed"
+
+
+leaseExpiry :: JobStatus -> Maybe Word64
+leaseExpiry status = case status of
+  JobLeased (LeaseInstant expiresAt) -> Just expiresAt
+  JobReady -> Nothing
+  JobCompleted -> Nothing
+
+
+backendJobFailure :: Either (JobError SQLiteStore) result
+backendJobFailure = Left (JobBackendFailed SQLiteCommitFailed)
 
 
 commitDeliveryTransaction

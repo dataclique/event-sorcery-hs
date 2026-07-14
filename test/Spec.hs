@@ -118,12 +118,19 @@ main = hspec do
       isDuplicateStream (commitBatch testLimits (append :| [append]))
         `shouldBe` True
 
+  describe "lease window validation" do
+    it "rejects a lease that does not advance time" do
+      mkLeaseWindow (LeaseInstant 20) (LeaseInstant 20)
+        `shouldBe` Nothing
+
   eventStoreContract "in-memory event store" withMemoryStore
   eventStoreContract "SQLite event store" withSQLiteStore
   projectionStoreContract "in-memory projection store" withMemoryStore
   projectionStoreContract "SQLite projection store" withSQLiteStore
   deliveryStoreContract "in-memory delivery store" withMemoryStore
   deliveryStoreContract "SQLite delivery store" withSQLiteStore
+  jobStoreContract "in-memory job store" withMemoryStore
+  jobStoreContract "SQLite job store" withSQLiteStore
 
 
 eventStoreContract
@@ -297,6 +304,45 @@ deliveryStoreContract label withStore = describe label do
         `shouldBe` Right (Right (Just (Account 15)))
 
 
+jobStoreContract
+  :: forall backend
+   . ( JobStore backend
+     , Eq (BackendError backend)
+     , Show (BackendError backend)
+     )
+  => [Char]
+  -> (forall result. (backend -> IO result) -> IO result)
+  -> Spec
+jobStoreContract label withStore = describe label do
+  it "enqueues the same payload idempotently and rejects a changed payload" $
+    withStore \store -> do
+      enqueueJob store jobId "payload" `shouldReturn` Right JobEnqueued
+      enqueueJob store jobId "payload"
+        `shouldReturn` Right JobAlreadyEnqueued
+      enqueueJob store jobId "changed"
+        `shouldReturn` Left (JobPayloadMismatch jobId)
+
+  it "fences a worker whose lease expired and was reclaimed" $
+    withStore \store -> do
+      enqueueJob store jobId "payload" `shouldReturn` Right JobEnqueued
+      claimJob store jobId firstLease
+        `shouldReturn` Right
+          (JobClaim (LeaseToken 1) (AttemptCount 1) "payload")
+      claimJob store jobId overlappingLease
+        `shouldReturn` Left
+          (JobLeaseUnavailable jobId (LeaseInstant 20))
+      claimJob store jobId replacementLease
+        `shouldReturn` Right
+          (JobClaim (LeaseToken 2) (AttemptCount 2) "payload")
+      acknowledgeJob store jobId (LeaseToken 1)
+        `shouldReturn` Left
+          (JobLeaseLost jobId (LeaseToken 1) (LeaseToken 2))
+      acknowledgeJob store jobId (LeaseToken 2) `shouldReturn` Right ()
+      acknowledgeJob store jobId (LeaseToken 2) `shouldReturn` Right ()
+      claimJob store jobId completedLease
+        `shouldReturn` Left (JobAlreadyCompleted jobId)
+
+
 withMemoryStore :: (MemoryStore -> IO result) -> IO result
 withMemoryStore action = newMemoryStore >>= action
 
@@ -330,6 +376,33 @@ balancesProjectionName =
 deliveryId :: DeliveryId
 deliveryId =
   fromMaybe (panic "invalid delivery id") (mkDeliveryId "delivery-1")
+
+
+jobId :: JobId
+jobId = fromMaybe (panic "invalid job id") (mkJobId "job-1")
+
+
+firstLease :: LeaseWindow
+firstLease = leaseWindow 10 20
+
+
+overlappingLease :: LeaseWindow
+overlappingLease = leaseWindow 19 30
+
+
+replacementLease :: LeaseWindow
+replacementLease = leaseWindow 20 30
+
+
+completedLease :: LeaseWindow
+completedLease = leaseWindow 30 40
+
+
+leaseWindow :: Word64 -> Word64 -> LeaseWindow
+leaseWindow claimedAt expiresAt =
+  fromMaybe
+    (panic "invalid lease window")
+    (mkLeaseWindow (LeaseInstant claimedAt) (LeaseInstant expiresAt))
 
 
 firstProjectionUpdate :: ProjectionUpdate

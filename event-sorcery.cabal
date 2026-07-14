@@ -54,12 +54,14 @@ library
     EventSorcery.Backend.Memory
     EventSorcery.Backend.SQLite
     EventSorcery.Delivery
+    EventSorcery.Job
     EventSorcery.Projection
     EventSorcery.Store
     EventSorcery.Stream
 
   other-modules:
     EventSorcery.Delivery.Internal
+    EventSorcery.Job.Internal
     EventSorcery.Projection.Internal
     EventSorcery.Store.Internal
 
