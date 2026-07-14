@@ -49,6 +49,12 @@ data MemoryJobFixture = MemoryJobFixture MemoryStore [LeaseWindow]
 data SQLiteJobFixture = SQLiteJobFixture SQLiteStore [LeaseWindow]
 
 
+data MemoryReactorFixture = MemoryReactorFixture MemoryStore [Word64]
+
+
+data SQLiteReactorFixture = SQLiteReactorFixture SQLiteStore [Word64]
+
+
 instance NFData MemoryFixture where
   rnf (MemoryFixture store) = store `seq` ()
 
@@ -67,6 +73,14 @@ instance NFData MemoryJobFixture where
 
 instance NFData SQLiteJobFixture where
   rnf (SQLiteJobFixture store windows) = store `seq` rnf windows
+
+
+instance NFData MemoryReactorFixture where
+  rnf (MemoryReactorFixture store offsets) = store `seq` rnf offsets
+
+
+instance NFData SQLiteReactorFixture where
+  rnf (SQLiteReactorFixture store offsets) = store `seq` rnf offsets
 
 
 instance EventSourced Account where
@@ -134,6 +148,16 @@ main = do
               setupSQLiteJobFixture
               closeSQLiteJobFixture
               claimSQLiteJob
+        ]
+    , bgroup
+        "reactor"
+        [ bench "memory/1000 outbox advances" $
+            perRunEnv setupMemoryReactorFixture advanceMemoryReactor
+        , bench "sqlite/1000 outbox advances" $
+            perRunEnvWithCleanup
+              setupSQLiteReactorFixture
+              closeSQLiteReactorFixture
+              advanceSQLiteReactor
         ]
     ]
 
@@ -213,12 +237,28 @@ setupSQLiteJobFixture = do
   pure (SQLiteJobFixture store benchmarkLeaseWindows)
 
 
+setupMemoryReactorFixture :: IO MemoryReactorFixture
+setupMemoryReactorFixture =
+  MemoryReactorFixture <$> newMemoryStore <*> pure benchmarkReactorOffsets
+
+
+setupSQLiteReactorFixture :: IO SQLiteReactorFixture
+setupSQLiteReactorFixture = do
+  store <- openBenchmarkSQLite
+  pure (SQLiteReactorFixture store benchmarkReactorOffsets)
+
+
 closeSQLiteCommitFixture :: SQLiteCommitFixture -> IO ()
 closeSQLiteCommitFixture (SQLiteCommitFixture store _) = closeSQLiteStore store
 
 
 closeSQLiteJobFixture :: SQLiteJobFixture -> IO ()
 closeSQLiteJobFixture (SQLiteJobFixture store _) = closeSQLiteStore store
+
+
+closeSQLiteReactorFixture :: SQLiteReactorFixture -> IO ()
+closeSQLiteReactorFixture (SQLiteReactorFixture store _) =
+  closeSQLiteStore store
 
 
 consumeMemory :: MemoryFixture -> IO Word64
@@ -293,6 +333,37 @@ claimJobs store = foldM claim 0
         other -> panic (show other)
 
 
+advanceMemoryReactor :: MemoryReactorFixture -> IO Word64
+advanceMemoryReactor (MemoryReactorFixture store offsets) =
+  advanceReactors store offsets
+
+
+advanceSQLiteReactor :: SQLiteReactorFixture -> IO Word64
+advanceSQLiteReactor (SQLiteReactorFixture store offsets) =
+  advanceReactors store offsets
+
+
+advanceReactors
+  :: (ReactorStore backend, Show (BackendError backend))
+  => backend
+  -> [Word64]
+  -> IO Word64
+advanceReactors store = foldM advance 0
+  where
+    advance _ offset = do
+      result <-
+        advanceReactor
+          store
+          ( reactorUpdate
+              benchmarkReactorName
+              (EventOffset offset)
+              (Just (benchmarkOutboxEntry offset))
+          )
+      case result of
+        Right ReactorCommitted -> pure offset
+        other -> panic (show other)
+
+
 benchmarkBatch :: Word64 -> IO CommitBatch
 benchmarkBatch count =
   either
@@ -358,6 +429,27 @@ benchmarkLeaseWindows = leaseWindow <$> [0 .. 999]
             (LeaseInstant claimedAt)
             (LeaseInstant (claimedAt + 1))
         )
+
+
+benchmarkReactorName :: ReactorName
+benchmarkReactorName =
+  fromMaybe
+    (panic "invalid benchmark reactor name")
+    (mkReactorName "benchmark-reactor")
+
+
+benchmarkReactorOffsets :: [Word64]
+benchmarkReactorOffsets = [1 .. 1000]
+
+
+benchmarkOutboxEntry :: Word64 -> OutboxEntry
+benchmarkOutboxEntry offset =
+  OutboxEntry
+    ( fromMaybe
+        (panic "invalid benchmark delivery id")
+        (mkDeliveryId ("benchmark-delivery-" <> show offset))
+    )
+    (CommandDelivery "payload")
 
 
 accountKey :: StreamKey Account
