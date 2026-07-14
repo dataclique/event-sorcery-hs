@@ -1,6 +1,6 @@
 # 01. Haskell-native event-sourcing architecture
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-14
 - Issue: https://github.com/dataclique/event-sorcery-hs/issues/1
 

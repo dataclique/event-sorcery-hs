@@ -4,15 +4,24 @@ module EventSorcery.Store.Internal (
   CommitError (..),
   CommitLimitViolation (..),
   CommitLimits (..),
+  EventOffset (..),
   EventStore (..),
   PayloadLimit (..),
   ProposedEvent (..),
+  SnapshotHistory (..),
+  SnapshotWrite (..),
+  StoredSnapshot (..),
   StreamAppend (..),
   StreamIdentity (..),
+  StoredEnvelope (..),
+  Store (..),
+  StoreConflict (..),
+  StoreError (..),
   Unrestricted (..),
   appendEvents,
   commitBatch,
   consumeCommitBatch,
+  consumeSnapshotWrite,
   currentVersion,
   proposedEvents,
   streamAppendEvents,
@@ -20,6 +29,7 @@ module EventSorcery.Store.Internal (
   streamAppendIdentity,
 ) where
 
+import Conduit (ConduitT)
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Set qualified as Set
@@ -42,6 +52,31 @@ data CommitLimits = CommitLimits PayloadLimit BatchLimit
 
 data StreamIdentity = StreamIdentity Text Text
   deriving stock (Eq, Ord, Show)
+
+
+newtype EventOffset = EventOffset Word64
+  deriving stock (Eq, Ord, Show)
+
+
+data StoredEnvelope = StoredEnvelope EventOffset StreamIdentity StoredEvent
+  deriving stock (Eq, Show)
+
+
+data SnapshotHistory
+  = RetainedHistory
+  | CompactedHistory
+  deriving stock (Eq, Show)
+
+
+data StoredSnapshot
+  = StoredSnapshot StreamVersion SchemaVersion SnapshotHistory ByteString
+  deriving stock (Eq)
+
+
+data SnapshotWrite where
+  SnapshotWrite
+    :: Unrestricted (StreamIdentity, StoredSnapshot)
+    %1 -> SnapshotWrite
 
 
 data ProposedEvent = ProposedEvent EventMetadata ByteString
@@ -79,6 +114,49 @@ deriving stock instance
   Show (BackendError backend) => Show (CommitError backend)
 
 
+data Store backend entity = Store backend CommitLimits (IO JobId)
+
+
+data StoreConflict entity
+  = EntityStreamConflict (StreamKey entity)
+  | JobStreamConflict JobId
+  | UnknownStreamConflict
+  deriving stock (Eq, Show)
+
+
+data StoreError backend entity
+  = StoreReplayFailed (ReplayError entity)
+  | StoreCommandRejected (CommandError entity)
+  | StoreDecisionRejected (ApplyError entity)
+  | StoreConcurrencyConflict
+      (StoreConflict entity)
+      ExpectedVersion
+      ExpectedVersion
+  | StoreBackendFailed (BackendError backend)
+  | StoreCommitLimitExceeded CommitLimitViolation
+  | StoreSnapshotDecodeFailed StreamVersion DecodeCause
+  | StoreSnapshotSchemaMismatch
+      SnapshotHistory
+      SchemaVersion
+      SchemaVersion
+
+
+deriving stock instance
+  ( Eq (ApplyError entity)
+  , Eq (BackendError backend)
+  , Eq (CommandError entity)
+  )
+  => Eq (StoreError backend entity)
+
+
+deriving stock instance
+  ( Show (ApplyError entity)
+  , Show (BackendError backend)
+  , Show (CommandError entity)
+  )
+  => Show (StoreError backend entity)
+
+
 class EventStore backend where
   type BackendError backend
 
@@ -87,6 +165,32 @@ class EventStore backend where
     :: backend
     -> StreamIdentity
     -> IO (Either (BackendError backend) [StoredEvent])
+  loadStreamAfter
+    :: backend
+    -> StreamIdentity
+    -> StreamVersion
+    -> IO (Either (BackendError backend) [StoredEvent])
+  loadSnapshot
+    :: backend
+    -> StreamIdentity
+    -> IO (Either (BackendError backend) (Maybe StoredSnapshot))
+  discardSnapshot
+    :: backend
+    -> StreamIdentity
+    -> IO (Either (BackendError backend) ())
+  storeSnapshot
+    :: backend
+    -> SnapshotWrite
+    %1 -> IO (Either (BackendError backend) ())
+  streamEventsAfter
+    :: backend
+    -> EventOffset
+    -> ConduitT
+         ()
+         StoredEnvelope
+         (ExceptT (BackendError backend) IO)
+         ()
+  streamEventsAfter _ _ = pure ()
   commit :: backend -> CommitBatch %1 -> IO (Either (CommitError backend) ())
 
 
@@ -134,6 +238,11 @@ commitBatch (CommitLimits payloadLimit batchLimit) appends = do
 consumeCommitBatch
   :: CommitBatch %1 -> Unrestricted (NonEmpty StreamAppend)
 consumeCommitBatch (CommitBatch appends) = appends
+
+
+consumeSnapshotWrite
+  :: SnapshotWrite %1 -> Unrestricted (StreamIdentity, StoredSnapshot)
+consumeSnapshotWrite (SnapshotWrite snapshot) = snapshot
 
 
 currentVersion :: [StoredEvent] -> ExpectedVersion

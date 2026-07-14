@@ -10,6 +10,7 @@ module EventSorcery.Aggregate (
   Member,
   SchemaVersion (..),
   dispatchIntent,
+  dispatchJobId,
   jobIdText,
   mkJobId,
 ) where
@@ -41,6 +42,7 @@ data DispatchIntent job = DispatchIntent JobId Text ByteString
 class Job job where
   jobType :: Proxy job -> Text
   encodeJob :: job -> ByteString
+  decodeJob :: ByteString -> Either DecodeCause job
 
 
 class Dispatches entity job where
@@ -80,6 +82,8 @@ class EventSourced entity where
   schemaVersion :: Proxy entity -> SchemaVersion
   encodeEvent :: Event entity -> ByteString
   decodeEvent :: ByteString -> Either DecodeCause (Event entity)
+  encodeSnapshot :: entity -> ByteString
+  decodeSnapshot :: ByteString -> Either DecodeCause entity
   originate :: Event entity -> Either (ApplyError entity) entity
   evolve :: entity -> Event entity -> Either (ApplyError entity) entity
   initialize :: Command entity -> Either (CommandError entity) (Effect entity)
@@ -100,3 +104,7 @@ jobIdText (JobId value) = value
 dispatchIntent :: forall job. Job job => JobId -> job -> DispatchIntent job
 dispatchIntent identifier job =
   DispatchIntent identifier (jobType (Proxy @job)) (encodeJob job)
+
+
+dispatchJobId :: DispatchIntent job -> JobId
+dispatchJobId (DispatchIntent identifier _ _) = identifier

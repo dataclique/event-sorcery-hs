@@ -42,6 +42,7 @@
       {
         checks = {
           inherit package;
+          benchmarks = pkgs.haskell.lib.doBenchmark package;
           formatting = hooks;
         };
 

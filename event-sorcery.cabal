@@ -53,14 +53,28 @@ library
     EventSorcery.Aggregate
     EventSorcery.Backend.Memory
     EventSorcery.Backend.SQLite
+    EventSorcery.Delivery
+    EventSorcery.Job
+    EventSorcery.Projection
+    EventSorcery.Reactor
+    EventSorcery.Schema
     EventSorcery.Store
     EventSorcery.Stream
 
-  other-modules:   EventSorcery.Store.Internal
+  other-modules:
+    EventSorcery.Delivery.Internal
+    EventSorcery.Job.Internal
+    EventSorcery.Projection.Internal
+    EventSorcery.Reactor.Internal
+    EventSorcery.Schema.Internal
+    EventSorcery.Store.Internal
+
   hs-source-dirs:  src
   build-depends:
     , base           >=4.18  && <5
+    , binary         >=0.8   && <0.9
     , bytestring     >=0.11  && <0.13
+    , conduit        >=1.3.6 && <1.4
     , containers     >=0.6   && <0.9
     , protolude      >=0.3.4 && <0.4
     , sqlite-simple  >=0.4   && <0.5
@@ -76,7 +90,24 @@ test-suite event-sorcery-test
     , aeson          >=2.2   && <2.3
     , base           >=4.18  && <5
     , bytestring     >=0.11  && <0.13
+    , conduit        >=1.3.6 && <1.4
     , event-sorcery
     , hspec          >=2.11  && <2.12
+    , protolude      >=0.3.4 && <0.4
+    , text           >=2.0   && <2.2
+
+benchmark event-sorcery-benchmark
+  import:         strict
+  type:           exitcode-stdio-1.0
+  main-is:        Bench.hs
+  hs-source-dirs: benchmark
+  ghc-options:    -O2 -rtsopts
+  build-depends:
+    , aeson          >=2.2   && <2.3
+    , base           >=4.18  && <5
+    , bytestring     >=0.11  && <0.13
+    , conduit        >=1.3.6 && <1.4
+    , criterion      >=1.6.4 && <1.7
+    , event-sorcery
     , protolude      >=0.3.4 && <0.4
     , text           >=2.0   && <2.2
