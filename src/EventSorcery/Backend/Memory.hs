@@ -16,10 +16,12 @@ import Data.List.NonEmpty qualified as NonEmpty
 import Data.Map.Strict qualified as Map
 import Data.Sequence qualified as Seq
 import Data.Set qualified as Set
+import EventSorcery.Aggregate (SchemaVersion)
 import EventSorcery.Delivery.Internal
 import EventSorcery.Job.Internal
 import EventSorcery.Projection.Internal
 import EventSorcery.Reactor.Internal
+import EventSorcery.Schema.Internal
 import EventSorcery.Store.Internal
 import EventSorcery.Stream
 import Protolude
@@ -36,6 +38,7 @@ data MemoryState = MemoryState
   , deliveryReceipts :: Set.Set DeliveryId
   , jobs :: Map.Map JobId JobRecord
   , reactors :: MemoryReactorState
+  , schemas :: Map.Map SchemaTarget SchemaVersion
   }
 
 
@@ -61,6 +64,7 @@ newMemoryStore =
         , deliveryReceipts = Set.empty
         , jobs = Map.empty
         , reactors = MemoryReactorState Map.empty Map.empty
+        , schemas = Map.empty
         }
 
 
@@ -211,6 +215,27 @@ instance ReactorStore MemoryStore where
                     reactorState
             writeTVar memoryState (setMemoryReactor nextReactorState current)
             pure (Right result)
+
+
+instance SchemaStore MemoryStore where
+  reconcileSchema
+    (MemoryStore memoryState)
+    (SchemaRegistration target requested) = atomically do
+      current <- readTVar memoryState
+      let (result, invalidation) =
+            decideSchemaReconciliation
+              requested
+              (Map.lookup target current.schemas)
+          reconciled =
+            case invalidation of
+              PreserveDerivedState -> current
+              InvalidateDerivedState -> invalidateMemorySchema target current
+          next =
+            reconciled
+              { schemas = Map.insert target requested reconciled.schemas
+              }
+      writeTVar memoryState next
+      pure (Right result)
 
 
 commitMemory
@@ -411,3 +436,22 @@ setMemoryReactor
   reactors
   memoryState =
     memoryState {reactors = reactors}
+
+
+invalidateMemorySchema :: SchemaTarget -> MemoryState -> MemoryState
+invalidateMemorySchema target memoryState = case target of
+  AggregateSchema aggregateName ->
+    memoryState
+      { snapshots =
+          Map.filterWithKey
+            (snapshotOutsideAggregate aggregateName)
+            memoryState.snapshots
+      }
+  ProjectionSchema name ->
+    memoryState {projections = Map.delete name memoryState.projections}
+
+
+snapshotOutsideAggregate
+  :: Text -> StreamIdentity -> StoredSnapshot -> Bool
+snapshotOutsideAggregate expected (StreamIdentity actual _) _ =
+  actual /= expected

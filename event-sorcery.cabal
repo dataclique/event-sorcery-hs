@@ -57,6 +57,7 @@ library
     EventSorcery.Job
     EventSorcery.Projection
     EventSorcery.Reactor
+    EventSorcery.Schema
     EventSorcery.Store
     EventSorcery.Stream
 
@@ -65,6 +66,7 @@ library
     EventSorcery.Job.Internal
     EventSorcery.Projection.Internal
     EventSorcery.Reactor.Internal
+    EventSorcery.Schema.Internal
     EventSorcery.Store.Internal
 
   hs-source-dirs:  src

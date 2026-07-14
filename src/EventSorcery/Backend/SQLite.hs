@@ -27,6 +27,7 @@ import EventSorcery.Delivery.Internal
 import EventSorcery.Job.Internal
 import EventSorcery.Projection.Internal
 import EventSorcery.Reactor.Internal
+import EventSorcery.Schema.Internal
 import EventSorcery.Store.Internal
 import EventSorcery.Stream
 import Protolude
@@ -275,6 +276,17 @@ instance ReactorStore SQLiteStore where
           Right result -> result
 
 
+instance SchemaStore SQLiteStore where
+  reconcileSchema store@(SQLiteStore connection _) registration = do
+    reconciled <-
+      trySQLite
+        ( withSQLiteTransaction
+            store
+            (reconcileSchemaTransaction connection registration)
+        )
+    pure (first SQLiteCommitFailed reconciled)
+
+
 commitSQLite
   :: SQLiteStore
   -> CommitBatch
@@ -393,6 +405,16 @@ migrate connection = do
       history TEXT NOT NULL,
       payload BLOB NOT NULL,
       PRIMARY KEY (aggregate_type, aggregate_id)
+    )
+    """
+  execute_
+    connection
+    """
+    CREATE TABLE IF NOT EXISTS schemas (
+      kind TEXT NOT NULL CHECK (kind IN ('aggregate', 'projection')),
+      name TEXT NOT NULL,
+      schema_version INTEGER NOT NULL,
+      PRIMARY KEY (kind, name)
     )
     """
 
@@ -672,6 +694,76 @@ storeProjectionState
         view = excluded.view
       """
       (name, offset, view)
+
+
+reconcileSchemaTransaction
+  :: Connection
+  -> SchemaRegistration
+  -> IO SchemaReconciliation
+reconcileSchemaTransaction
+  connection
+  (SchemaRegistration target requested) = do
+    current <- loadSchemaVersion connection target
+    let (result, invalidation) = decideSchemaReconciliation requested current
+    case invalidation of
+      PreserveDerivedState -> pure ()
+      InvalidateDerivedState -> invalidateSQLiteSchema connection target
+    unless (result == SchemaCurrent) do
+      storeSchemaVersion connection target requested
+    pure result
+
+
+loadSchemaVersion
+  :: Connection -> SchemaTarget -> IO (Maybe SchemaVersion)
+loadSchemaVersion connection target = do
+  rows <-
+    query
+      connection
+      """
+      SELECT schema_version
+      FROM schemas
+      WHERE kind = ? AND name = ?
+      """
+      (schemaTargetParts target)
+  pure case rows of
+    Only version : _ -> Just (SchemaVersion version)
+    [] -> Nothing
+
+
+storeSchemaVersion
+  :: Connection -> SchemaTarget -> SchemaVersion -> IO ()
+storeSchemaVersion connection target (SchemaVersion version) =
+  execute
+    connection
+    """
+    INSERT INTO schemas (kind, name, schema_version)
+    VALUES (?, ?, ?)
+    ON CONFLICT (kind, name) DO UPDATE SET
+      schema_version = excluded.schema_version
+    """
+    (kind, name, version)
+  where
+    (kind, name) = schemaTargetParts target
+
+
+invalidateSQLiteSchema :: Connection -> SchemaTarget -> IO ()
+invalidateSQLiteSchema connection target = case target of
+  AggregateSchema aggregateName ->
+    execute
+      connection
+      "DELETE FROM snapshots WHERE aggregate_type = ?"
+      (Only aggregateName)
+  ProjectionSchema (ProjectionName name) ->
+    execute
+      connection
+      "DELETE FROM projections WHERE name = ?"
+      (Only name)
+
+
+schemaTargetParts :: SchemaTarget -> (Text, Text)
+schemaTargetParts target = case target of
+  AggregateSchema name -> ("aggregate", name)
+  ProjectionSchema (ProjectionName name) -> ("projection", name)
 
 
 enqueueJobTransaction

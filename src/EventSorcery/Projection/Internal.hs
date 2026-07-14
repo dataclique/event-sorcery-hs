@@ -23,6 +23,7 @@ newtype ProjectionName = ProjectionName Text
 
 data Projection entity view projectionError = Projection
   { name :: ProjectionName
+  , version :: SchemaVersion
   , initial :: view
   , apply :: view -> Event entity -> Either projectionError view
   , encode :: view -> ByteString

@@ -209,6 +209,8 @@ main = hspec do
   jobStoreContract "SQLite job store" withSQLiteStore
   reactorStoreContract "in-memory reactor store" withMemoryStore
   reactorStoreContract "SQLite reactor store" withSQLiteStore
+  schemaStoreContract "in-memory schema store" withMemoryStore
+  schemaStoreContract "SQLite schema store" withSQLiteStore
   storeContract "in-memory typed store" withMemoryStore
   storeContract "SQLite typed store" withSQLiteStore
   snapshotContract "in-memory snapshots" withMemoryStore
@@ -652,6 +654,67 @@ snapshotContract label withBackend = describe label do
           )
 
 
+schemaStoreContract
+  :: forall backend
+   . ( Eq (BackendError backend)
+     , ProjectionStore backend
+     , SchemaStore backend
+     , Show (BackendError backend)
+     )
+  => [Char]
+  -> (forall result. (backend -> IO result) -> IO result)
+  -> Spec
+schemaStoreContract label withBackend = describe label do
+  it "preserves derived state when registered schemas remain current" $
+    withBackend \backend -> do
+      let store = mkStore backend testLimits (pure jobId)
+      reconcileEntitySchema (Proxy @Account) backend
+        `shouldReturn` Right SchemaRegistered
+      reconcileProjectionSchema backend balanceProjection
+        `shouldReturn` Right SchemaRegistered
+      executeCommand store accountKey (Open 10)
+        `shouldReturn` Right (Account 10)
+      snapshotEntity store accountKey RetainedHistory
+        `shouldReturn` Right (Just (Account 10))
+      catchUpProjection backend balanceProjection
+        `shouldReturn` Right (BalanceView 10)
+      reconcileEntitySchema (Proxy @Account) backend
+        `shouldReturn` Right SchemaCurrent
+      reconcileProjectionSchema backend balanceProjection
+        `shouldReturn` Right SchemaCurrent
+      loadedSnapshot <- loadSnapshot backend accountIdentity
+      fmap isJust loadedSnapshot `shouldBe` Right True
+      loadedProjection <- loadProjection backend balancesProjectionName
+      fmap isJust loadedProjection `shouldBe` Right True
+
+  it "invalidates only replayable derived state when schemas change" $
+    withBackend \backend -> do
+      let store = mkStore backend testLimits (pure jobId)
+          upgradedStore = mkStore backend testLimits (pure jobId)
+      reconcileEntitySchema (Proxy @Account) backend
+        `shouldReturn` Right SchemaRegistered
+      reconcileProjectionSchema backend balanceProjection
+        `shouldReturn` Right SchemaRegistered
+      executeCommand store accountKey (Open 10)
+        `shouldReturn` Right (Account 10)
+      snapshotEntity store accountKey RetainedHistory
+        `shouldReturn` Right (Just (Account 10))
+      catchUpProjection backend balanceProjection
+        `shouldReturn` Right (BalanceView 10)
+      reconcileEntitySchema (Proxy @AccountV2) backend
+        `shouldReturn` Right (SchemaChanged (SchemaVersion 1))
+      discardedSnapshot <- loadSnapshot backend accountIdentity
+      fmap isNothing discardedSnapshot `shouldBe` Right True
+      loadEntity upgradedStore accountV2Key
+        `shouldReturn` Right (Just (AccountV2 10))
+      reconcileProjectionSchema backend balanceProjectionV2
+        `shouldReturn` Right (SchemaChanged (SchemaVersion 1))
+      discardedProjection <- loadProjection backend balancesProjectionName
+      fmap isNothing discardedProjection `shouldBe` Right True
+      catchUpProjection backend balanceProjectionV2
+        `shouldReturn` Right (BalanceView 10)
+
+
 withMemoryStore :: (MemoryStore -> IO result) -> IO result
 withMemoryStore action = newMemoryStore >>= action
 
@@ -686,6 +749,7 @@ balanceProjection :: Projection Account BalanceView BalanceProjectionError
 balanceProjection =
   Projection
     { name = balancesProjectionName
+    , version = SchemaVersion 1
     , initial = BalanceView 0
     , apply = applyBalanceEvent
     , encode = LazyByteString.toStrict . Aeson.encode
@@ -693,6 +757,10 @@ balanceProjection =
         first (const (DecodeCause "invalid balance projection"))
           . Aeson.eitherDecodeStrict'
     }
+
+
+balanceProjectionV2 :: Projection Account BalanceView BalanceProjectionError
+balanceProjectionV2 = balanceProjection {version = SchemaVersion 2}
 
 
 applyBalanceEvent

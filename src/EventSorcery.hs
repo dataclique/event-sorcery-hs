@@ -4,6 +4,7 @@ module EventSorcery (
   module EventSorcery.Job,
   module EventSorcery.Projection,
   module EventSorcery.Reactor,
+  module EventSorcery.Schema,
   module EventSorcery.Store,
   module EventSorcery.Stream,
 ) where
@@ -13,6 +14,7 @@ import EventSorcery.Delivery
 import EventSorcery.Job
 import EventSorcery.Projection
 import EventSorcery.Reactor
+import EventSorcery.Schema
 import EventSorcery.Store
 import EventSorcery.Stream
 

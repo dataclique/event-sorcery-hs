@@ -712,6 +712,7 @@ benchmarkProjection :: Projection Account Word64 BenchmarkProjectionError
 benchmarkProjection =
   Projection
     { name = projectionName
+    , version = SchemaVersion 1
     , initial = 0
     , apply = applyBenchmarkProjection
     , encode = LazyByteString.toStrict . Aeson.encode
