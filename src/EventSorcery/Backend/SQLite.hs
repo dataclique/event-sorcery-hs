@@ -204,6 +204,11 @@ instance ProjectionStore SQLiteStore where
 
 
 instance DeliveryStore SQLiteStore where
+  loadDeliveryReceipt (SQLiteStore connection _) delivery = do
+    loaded <- trySQLite (deliveryRecorded connection delivery)
+    pure (first SQLiteReadFailed loaded)
+
+
   commitDelivery store@(SQLiteStore connection _) delivery batch =
     case consumeCommitBatch batch of
       Unrestricted appends -> do

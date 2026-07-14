@@ -143,6 +143,11 @@ instance ProjectionStore MemoryStore where
 
 
 instance DeliveryStore MemoryStore where
+  loadDeliveryReceipt (MemoryStore memoryState) delivery = do
+    current <- readTVarIO memoryState
+    pure (Right (Set.member delivery current.deliveryReceipts))
+
+
   commitDelivery (MemoryStore memoryState) delivery batch =
     case consumeCommitBatch batch of
       Unrestricted appends -> atomically do

@@ -268,6 +268,8 @@ main = hspec do
   projectionStoreContract "SQLite projection store" withSQLiteStore
   deliveryStoreContract "in-memory delivery store" withMemoryStore
   deliveryStoreContract "SQLite delivery store" withSQLiteStore
+  commandDeliveryContract "in-memory command delivery" withMemoryStore
+  commandDeliveryContract "SQLite command delivery" withSQLiteStore
   jobStoreContract "in-memory job store" withMemoryStore
   jobStoreContract "SQLite job store" withSQLiteStore
   jobRuntimeContract "in-memory job runtime" withMemoryStore
@@ -505,6 +507,28 @@ deliveryStoreContract label withStore = describe label do
       loaded <- loadStream store accountIdentity
       (replay accountKey <$> loaded)
         `shouldBe` Right (Right (Just (Account 15)))
+
+
+commandDeliveryContract
+  :: forall backend
+   . ( DeliveryStore backend
+     , Eq (BackendError backend)
+     , Show (BackendError backend)
+     )
+  => [Char]
+  -> (forall result. (backend -> IO result) -> IO result)
+  -> Spec
+commandDeliveryContract label withBackend = describe label do
+  it "does not decide or append an acknowledged command twice" $
+    withBackend \backend -> do
+      let store = mkStore backend testLimits (pure jobId)
+      executeCommand store accountKey (Open 10)
+        `shouldReturn` Right (Account 10)
+      deliverCommand store deliveryId accountKey (Deposit 5)
+        `shouldReturn` Right DeliveryApplied
+      deliverCommand store deliveryId accountKey (Deposit 100)
+        `shouldReturn` Right DeliveryAlreadyApplied
+      loadEntity store accountKey `shouldReturn` Right (Just (Account 15))
 
 
 jobStoreContract

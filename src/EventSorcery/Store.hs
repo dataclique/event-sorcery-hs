@@ -20,6 +20,7 @@ module EventSorcery.Store (
   appendEvents,
   commitBatch,
   consumeCommitBatch,
+  deliverCommand,
   mkBatchLimit,
   mkCommitLimits,
   mkPayloadLimit,
@@ -36,6 +37,7 @@ module EventSorcery.Store (
 ) where
 
 import EventSorcery.Aggregate
+import EventSorcery.Delivery.Internal
 import EventSorcery.Job.Internal (
   AttemptCount (..),
   JobLifecycleEvent (..),
@@ -128,25 +130,59 @@ executeCommand
   -> StreamKey entity
   -> Command entity
   -> IO (Either (StoreError backend entity) entity)
-executeCommand (Store backend limits nextJobId) key command = do
+executeCommand store@(Store backend limits _) key command = do
+  prepared <- prepareCommand store key command
+  case prepared of
+    Left failure -> pure (Left failure)
+    Right (next, appends) ->
+      commitEffect backend limits key next appends
+
+
+deliverCommand
+  :: forall backend entity
+   . (EventSourced entity, DeliveryStore backend)
+  => Store backend entity
+  -> DeliveryId
+  -> StreamKey entity
+  -> Command entity
+  -> IO (Either (StoreError backend entity) DeliveryCommit)
+deliverCommand store@(Store backend limits _) delivery key command = do
+  recorded <- loadDeliveryReceipt backend delivery
+  case recorded of
+    Left failure -> pure (Left (StoreBackendFailed failure))
+    Right True -> pure (Right DeliveryAlreadyApplied)
+    Right False -> do
+      prepared <- prepareCommand store key command
+      case prepared of
+        Left failure -> pure (Left failure)
+        Right (_, appends) ->
+          commitDeliveryEffect backend limits delivery key appends
+
+
+prepareCommand
+  :: (EventSourced entity, EventStore backend)
+  => Store backend entity
+  -> StreamKey entity
+  -> Command entity
+  -> IO
+       ( Either
+           (StoreError backend entity)
+           (entity, NonEmpty StreamAppend)
+       )
+prepareCommand (Store backend _ nextJobId) key command = do
   loaded <- loadCurrent backend key
   case loaded of
     Left failure -> pure (Left failure)
     Right (current, expected) -> case decide current of
       Left failure -> pure (Left (StoreCommandRejected failure))
-      Right effect -> do
-        interpreted <-
-          interpretEffect
-            backend
-            nextJobId
-            key
-            expected
-            current
-            effect
-        case interpreted of
-          Left failure -> pure (Left failure)
-          Right (next, appends) ->
-            commitEffect backend limits key next appends
+      Right effect ->
+        interpretEffect
+          backend
+          nextJobId
+          key
+          expected
+          current
+          effect
   where
     decide current = case current of
       Nothing -> initialize command
@@ -313,6 +349,31 @@ commitEffect backend limits key next appends =
             )
         Left (BackendFailed failure) -> Left (StoreBackendFailed failure)
         Right () -> Right next
+
+
+commitDeliveryEffect
+  :: DeliveryStore backend
+  => backend
+  -> CommitLimits
+  -> DeliveryId
+  -> StreamKey entity
+  -> NonEmpty StreamAppend
+  -> IO (Either (StoreError backend entity) DeliveryCommit)
+commitDeliveryEffect backend limits delivery key appends =
+  case commitBatch limits appends of
+    Left failure -> pure (Left (StoreCommitLimitExceeded failure))
+    Right batch -> do
+      committed <- commitDelivery backend delivery batch
+      pure case committed of
+        Left (ConcurrencyConflict conflictingStream expected actual) ->
+          Left
+            ( StoreConcurrencyConflict
+                (classifyConflict key conflictingStream)
+                expected
+                actual
+            )
+        Left (BackendFailed failure) -> Left (StoreBackendFailed failure)
+        Right result -> Right result
 
 
 applyEvents

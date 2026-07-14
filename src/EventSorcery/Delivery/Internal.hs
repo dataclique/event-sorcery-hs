@@ -19,6 +19,12 @@ data DeliveryCommit
 
 
 class EventStore backend => DeliveryStore backend where
+  loadDeliveryReceipt
+    :: backend
+    -> DeliveryId
+    -> IO (Either (BackendError backend) Bool)
+
+
   commitDelivery
     :: backend
     -> DeliveryId
