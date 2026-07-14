@@ -44,6 +44,14 @@ data BenchmarkProjectionError = BenchmarkProjectionError
   deriving stock (Eq, Show)
 
 
+data BenchmarkReactorError = BenchmarkReactorError
+  deriving stock (Eq, Show)
+
+
+data BenchmarkJobFailure = BenchmarkJobFailure
+  deriving stock (Eq, Show)
+
+
 newtype BenchmarkJob = BenchmarkJob ByteString
 
 
@@ -62,10 +70,34 @@ data MemoryJobFixture = MemoryJobFixture MemoryStore [LeaseWindow]
 data SQLiteJobFixture = SQLiteJobFixture SQLiteStore [LeaseWindow]
 
 
+data MemoryJobRuntimeFixture
+  = MemoryJobRuntimeFixture (JobRuntime MemoryStore) LeaseWindow
+
+
+data SQLiteJobRuntimeFixture
+  = SQLiteJobRuntimeFixture
+      SQLiteStore
+      (JobRuntime SQLiteStore)
+      LeaseWindow
+
+
 data MemoryReactorFixture = MemoryReactorFixture MemoryStore [Word64]
 
 
 data SQLiteReactorFixture = SQLiteReactorFixture SQLiteStore [Word64]
+
+
+data MemoryOutboxFixture
+  = MemoryOutboxFixture
+      (OutboxRuntime MemoryStore)
+      OutboxLeaseWindow
+
+
+data SQLiteOutboxFixture
+  = SQLiteOutboxFixture
+      SQLiteStore
+      (OutboxRuntime SQLiteStore)
+      OutboxLeaseWindow
 
 
 newtype MemoryDispatchFixture = MemoryDispatchFixture (Store MemoryStore Account)
@@ -102,12 +134,30 @@ instance NFData SQLiteJobFixture where
   rnf (SQLiteJobFixture store windows) = store `seq` rnf windows
 
 
+instance NFData MemoryJobRuntimeFixture where
+  rnf (MemoryJobRuntimeFixture runtime window) = runtime `seq` window `seq` ()
+
+
+instance NFData SQLiteJobRuntimeFixture where
+  rnf (SQLiteJobRuntimeFixture store runtime window) =
+    store `seq` runtime `seq` window `seq` ()
+
+
 instance NFData MemoryReactorFixture where
   rnf (MemoryReactorFixture store offsets) = store `seq` rnf offsets
 
 
 instance NFData SQLiteReactorFixture where
   rnf (SQLiteReactorFixture store offsets) = store `seq` rnf offsets
+
+
+instance NFData MemoryOutboxFixture where
+  rnf (MemoryOutboxFixture runtime window) = runtime `seq` window `seq` ()
+
+
+instance NFData SQLiteOutboxFixture where
+  rnf (SQLiteOutboxFixture store runtime window) =
+    store `seq` runtime `seq` window `seq` ()
 
 
 instance NFData MemoryDispatchFixture where
@@ -130,6 +180,19 @@ instance Job BenchmarkJob where
   jobType _ = "benchmark-job"
   encodeJob (BenchmarkJob payload) = payload
   decodeJob = Right . BenchmarkJob
+
+
+instance DurableJob BenchmarkJob where
+  type JobInput BenchmarkJob = ()
+  type JobOutput BenchmarkJob = Word64
+  type JobFailureCause BenchmarkJob = BenchmarkJobFailure
+
+
+  submitJob _ _ (BenchmarkJob payload) =
+    pure (Right (JobDone (fromIntegral (ByteString.length payload))))
+
+
+  reconcileJob _ _ _ = pure (Right NotSubmitted)
 
 
 instance Dispatches Account BenchmarkJob where
@@ -225,6 +288,13 @@ main = do
               setupSQLiteJobFixture
               closeSQLiteJobFixture
               claimSQLiteJob
+        , bench "memory/durable execution" $
+            perRunEnv setupMemoryJobRuntimeFixture runMemoryJob
+        , bench "sqlite/durable execution" $
+            perRunEnvWithCleanup
+              setupSQLiteJobRuntimeFixture
+              closeSQLiteJobRuntimeFixture
+              runSQLiteJob
         ]
     , bgroup
         "reactor"
@@ -235,6 +305,20 @@ main = do
               setupSQLiteReactorFixture
               closeSQLiteReactorFixture
               advanceSQLiteReactor
+        , bench "memory/10000 catch-up" $
+            perRunEnv setupMemoryFixture catchUpMemoryReactor
+        , bench "sqlite/10000 catch-up" $
+            perRunEnvWithCleanup
+              setupSQLiteFixture
+              closeSQLiteFixture
+              catchUpSQLiteReactor
+        , bench "memory/outbox delivery" $
+            perRunEnv setupMemoryOutboxFixture deliverMemoryOutbox
+        , bench "sqlite/outbox delivery" $
+            perRunEnvWithCleanup
+              setupSQLiteOutboxFixture
+              closeSQLiteOutboxFixture
+              deliverSQLiteOutbox
         ]
     , bgroup
         "typed-store"
@@ -403,6 +487,26 @@ setupSQLiteJobFixture = do
   pure (SQLiteJobFixture store benchmarkLeaseWindows)
 
 
+setupMemoryJobRuntimeFixture :: IO MemoryJobRuntimeFixture
+setupMemoryJobRuntimeFixture = do
+  store <- newMemoryStore
+  let runtime =
+        mkJobRuntime store benchmarkAttemptLimit benchmarkJobRetrySchedule
+  enqueueDurableJob runtime benchmarkJobId (BenchmarkJob "payload")
+    >>= requireJobEnqueued
+  pure (MemoryJobRuntimeFixture runtime benchmarkJobLeaseWindow)
+
+
+setupSQLiteJobRuntimeFixture :: IO SQLiteJobRuntimeFixture
+setupSQLiteJobRuntimeFixture = do
+  store <- openBenchmarkSQLite
+  let runtime =
+        mkJobRuntime store benchmarkAttemptLimit benchmarkJobRetrySchedule
+  enqueueDurableJob runtime benchmarkJobId (BenchmarkJob "payload")
+    >>= requireJobEnqueued
+  pure (SQLiteJobRuntimeFixture store runtime benchmarkJobLeaseWindow)
+
+
 setupMemoryReactorFixture :: IO MemoryReactorFixture
 setupMemoryReactorFixture =
   MemoryReactorFixture <$> newMemoryStore <*> pure benchmarkReactorOffsets
@@ -414,6 +518,29 @@ setupSQLiteReactorFixture = do
   pure (SQLiteReactorFixture store benchmarkReactorOffsets)
 
 
+setupMemoryOutboxFixture :: IO MemoryOutboxFixture
+setupMemoryOutboxFixture = do
+  store <- newMemoryStore
+  advanceReactor store benchmarkFirstReactorUpdate >>= requireReactorCommit
+  pure
+    ( MemoryOutboxFixture
+        (mkOutboxRuntime store benchmarkOutboxLimit benchmarkOutboxRetrySchedule)
+        benchmarkOutboxLeaseWindow
+    )
+
+
+setupSQLiteOutboxFixture :: IO SQLiteOutboxFixture
+setupSQLiteOutboxFixture = do
+  store <- openBenchmarkSQLite
+  advanceReactor store benchmarkFirstReactorUpdate >>= requireReactorCommit
+  pure
+    ( SQLiteOutboxFixture
+        store
+        (mkOutboxRuntime store benchmarkOutboxLimit benchmarkOutboxRetrySchedule)
+        benchmarkOutboxLeaseWindow
+    )
+
+
 closeSQLiteCommitFixture :: SQLiteCommitFixture -> IO ()
 closeSQLiteCommitFixture (SQLiteCommitFixture store _) = closeSQLiteStore store
 
@@ -422,8 +549,18 @@ closeSQLiteJobFixture :: SQLiteJobFixture -> IO ()
 closeSQLiteJobFixture (SQLiteJobFixture store _) = closeSQLiteStore store
 
 
+closeSQLiteJobRuntimeFixture :: SQLiteJobRuntimeFixture -> IO ()
+closeSQLiteJobRuntimeFixture (SQLiteJobRuntimeFixture store _ _) =
+  closeSQLiteStore store
+
+
 closeSQLiteReactorFixture :: SQLiteReactorFixture -> IO ()
 closeSQLiteReactorFixture (SQLiteReactorFixture store _) =
+  closeSQLiteStore store
+
+
+closeSQLiteOutboxFixture :: SQLiteOutboxFixture -> IO ()
+closeSQLiteOutboxFixture (SQLiteOutboxFixture store _ _) =
   closeSQLiteStore store
 
 
@@ -535,6 +672,34 @@ claimJobs store = foldM claim 0
         other -> panic (show other)
 
 
+runMemoryJob :: MemoryJobRuntimeFixture -> IO Word64
+runMemoryJob (MemoryJobRuntimeFixture runtime window) =
+  runBenchmarkJob runtime window
+
+
+runSQLiteJob :: SQLiteJobRuntimeFixture -> IO Word64
+runSQLiteJob (SQLiteJobRuntimeFixture _ runtime window) =
+  runBenchmarkJob runtime window
+
+
+runBenchmarkJob
+  :: (JobStore backend, Show (BackendError backend))
+  => JobRuntime backend
+  -> LeaseWindow
+  -> IO Word64
+runBenchmarkJob runtime window = do
+  result <-
+    runJobOnce
+      (Proxy @BenchmarkJob)
+      runtime
+      ()
+      benchmarkJobId
+      window
+  pure case result of
+    Right (JobSucceeded payloadSize) -> payloadSize
+    other -> panic (show other)
+
+
 advanceMemoryReactor :: MemoryReactorFixture -> IO Word64
 advanceMemoryReactor (MemoryReactorFixture store offsets) =
   advanceReactors store offsets
@@ -564,6 +729,67 @@ advanceReactors store = foldM advance 0
       case result of
         Right ReactorCommitted -> pure offset
         other -> panic (show other)
+
+
+catchUpMemoryReactor :: MemoryFixture -> IO Word64
+catchUpMemoryReactor (MemoryFixture store) =
+  requireReactorResult (catchUpReactor store benchmarkReactor)
+
+
+catchUpSQLiteReactor :: SQLiteFixture -> IO Word64
+catchUpSQLiteReactor (SQLiteFixture store) =
+  requireReactorResult (catchUpReactor store benchmarkReactor)
+
+
+requireReactorResult
+  :: (Show (BackendError backend), Show reactorError)
+  => IO (Either (ReactorRunError backend reactorError) EventOffset)
+  -> IO Word64
+requireReactorResult action = do
+  result <- action
+  pure case result of
+    Right (EventOffset offset) -> offset
+    Left failure -> panic (show failure)
+
+
+deliverMemoryOutbox :: MemoryOutboxFixture -> IO Word64
+deliverMemoryOutbox (MemoryOutboxFixture runtime window) =
+  deliverBenchmarkOutbox runtime window
+
+
+deliverSQLiteOutbox :: SQLiteOutboxFixture -> IO Word64
+deliverSQLiteOutbox (SQLiteOutboxFixture _ runtime window) =
+  deliverBenchmarkOutbox runtime window
+
+
+deliverBenchmarkOutbox
+  :: (ReactorStore backend, Show (BackendError backend))
+  => OutboxRuntime backend
+  -> OutboxLeaseWindow
+  -> IO Word64
+deliverBenchmarkOutbox runtime window = do
+  result <-
+    runOutboxOnce
+      runtime
+      benchmarkDeliveryId
+      window
+      benchmarkDelivery
+  pure case result of
+    Right DeliverySucceeded -> 1
+    other -> panic (show other)
+
+
+benchmarkDelivery
+  :: DeliveryId
+  -> OutboxPayload
+  -> IO (Either (OutboxDeliveryFailure BenchmarkJobFailure) ())
+benchmarkDelivery _ payload = evaluate (forceOutboxPayload payload) $> Right ()
+
+
+forceOutboxPayload :: OutboxPayload -> Int
+forceOutboxPayload payload = case payload of
+  CommandDelivery bytes -> ByteString.length bytes
+  JobDispatch bytes -> ByteString.length bytes
 
 
 executeMemoryOpen :: MemoryFixture -> IO Word64
@@ -692,6 +918,15 @@ requireJobEnqueued result = case result of
   other -> panic (show other)
 
 
+requireReactorCommit
+  :: Show (BackendError backend)
+  => Either (ReactorError backend) ReactorCommit
+  -> IO ()
+requireReactorCommit result = case result of
+  Right ReactorCommitted -> pure ()
+  other -> panic (show other)
+
+
 openBenchmarkSQLite :: IO SQLiteStore
 openBenchmarkSQLite =
   openSQLiteStore ":memory:" >>= either (panic . show) pure
@@ -736,6 +971,22 @@ benchmarkJobId =
   fromMaybe (panic "invalid benchmark job id") (mkJobId "benchmark-job")
 
 
+benchmarkAttemptLimit :: AttemptLimit
+benchmarkAttemptLimit =
+  fromMaybe (panic "invalid benchmark attempt limit") (mkAttemptLimit 3)
+
+
+benchmarkJobRetrySchedule :: AttemptCount -> LeaseInstant
+benchmarkJobRetrySchedule (AttemptCount attempt) = LeaseInstant (20 + attempt)
+
+
+benchmarkJobLeaseWindow :: LeaseWindow
+benchmarkJobLeaseWindow =
+  fromMaybe
+    (panic "invalid benchmark job lease")
+    (mkLeaseWindow (LeaseInstant 0) (LeaseInstant 10))
+
+
 benchmarkLeaseWindows :: [LeaseWindow]
 benchmarkLeaseWindows = leaseWindow <$> [0 .. 999]
   where
@@ -755,8 +1006,44 @@ benchmarkReactorName =
     (mkReactorName "benchmark-reactor")
 
 
+benchmarkReactor :: Reactor Account BenchmarkReactorError
+benchmarkReactor = Reactor benchmarkReactorName (\_ _ -> Right Nothing)
+
+
 benchmarkReactorOffsets :: [Word64]
 benchmarkReactorOffsets = [1 .. 1000]
+
+
+benchmarkDeliveryId :: DeliveryId
+benchmarkDeliveryId =
+  fromMaybe
+    (panic "invalid benchmark delivery id")
+    (mkDeliveryId "benchmark-delivery")
+
+
+benchmarkFirstReactorUpdate :: ReactorUpdate
+benchmarkFirstReactorUpdate =
+  reactorUpdate
+    benchmarkReactorName
+    (EventOffset 1)
+    (Just (OutboxEntry benchmarkDeliveryId (CommandDelivery "payload")))
+
+
+benchmarkOutboxLimit :: OutboxAttemptLimit
+benchmarkOutboxLimit =
+  fromMaybe (panic "invalid benchmark outbox limit") (mkOutboxAttemptLimit 3)
+
+
+benchmarkOutboxRetrySchedule :: OutboxAttempt -> OutboxInstant
+benchmarkOutboxRetrySchedule (OutboxAttempt attempt) =
+  OutboxInstant (20 + attempt)
+
+
+benchmarkOutboxLeaseWindow :: OutboxLeaseWindow
+benchmarkOutboxLeaseWindow =
+  fromMaybe
+    (panic "invalid benchmark outbox lease")
+    (mkOutboxLeaseWindow (OutboxInstant 0) (OutboxInstant 10))
 
 
 benchmarkOutboxEntry :: Word64 -> OutboxEntry
