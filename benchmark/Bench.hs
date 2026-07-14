@@ -17,7 +17,8 @@ newtype AccountId = AccountId Text
 
 
 newtype Account = Account Word64
-  deriving stock (Eq, Show)
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (Aeson.FromJSON, Aeson.ToJSON)
 
 
 data AccountCommand = Open | Notify
@@ -74,6 +75,13 @@ data SQLiteDispatchFixture
   = SQLiteDispatchFixture SQLiteStore (Store SQLiteStore Account)
 
 
+newtype MemoryLoadFixture = MemoryLoadFixture (Store MemoryStore Account)
+
+
+data SQLiteLoadFixture
+  = SQLiteLoadFixture SQLiteStore (Store SQLiteStore Account)
+
+
 instance NFData MemoryFixture where
   rnf (MemoryFixture store) = store `seq` ()
 
@@ -110,6 +118,14 @@ instance NFData SQLiteDispatchFixture where
   rnf (SQLiteDispatchFixture backend store) = backend `seq` store `seq` ()
 
 
+instance NFData MemoryLoadFixture where
+  rnf (MemoryLoadFixture store) = store `seq` ()
+
+
+instance NFData SQLiteLoadFixture where
+  rnf (SQLiteLoadFixture backend store) = backend `seq` store `seq` ()
+
+
 instance Job BenchmarkJob where
   jobType _ = "benchmark-job"
   encodeJob (BenchmarkJob payload) = payload
@@ -139,6 +155,10 @@ instance EventSourced Account where
   encodeEvent = LazyByteString.toStrict . Aeson.encode
   decodeEvent =
     first (const (DecodeCause "invalid benchmark event"))
+      . Aeson.eitherDecodeStrict'
+  encodeSnapshot = LazyByteString.toStrict . Aeson.encode
+  decodeSnapshot =
+    first (const (DecodeCause "invalid benchmark snapshot"))
       . Aeson.eitherDecodeStrict'
   originate (Opened amount) = Right (Account amount)
   originate (Deposited _) = Left AccountApplyError
@@ -232,6 +252,17 @@ main = do
               closeSQLiteDispatchFixture
               executeSQLiteNotify
         ]
+    , bgroup
+        "snapshot"
+        [ env setupMemoryLoadFixture $
+            bench "memory/10000 full replay" . nfIO . loadMemoryEntity
+        , env setupMemorySnapshotFixture $
+            bench "memory/10000 snapshot load" . nfIO . loadMemoryEntity
+        , envWithCleanup setupSQLiteLoadFixture closeSQLiteLoadFixture $
+            bench "sqlite/10000 full replay" . nfIO . loadSQLiteEntity
+        , envWithCleanup setupSQLiteSnapshotFixture closeSQLiteLoadFixture $
+            bench "sqlite/10000 snapshot load" . nfIO . loadSQLiteEntity
+        ]
     ]
 
 
@@ -305,6 +336,33 @@ setupSQLiteDispatchFixture = do
   pure (SQLiteDispatchFixture backend store)
 
 
+setupMemoryLoadFixture :: IO MemoryLoadFixture
+setupMemoryLoadFixture = do
+  MemoryFixture backend <- setupMemoryFixture
+  MemoryLoadFixture <$> benchmarkStore backend
+
+
+setupMemorySnapshotFixture :: IO MemoryLoadFixture
+setupMemorySnapshotFixture = do
+  fixture@(MemoryLoadFixture store) <- setupMemoryLoadFixture
+  snapshotEntity store accountKey RetainedHistory >>= requireSnapshot
+  pure fixture
+
+
+setupSQLiteLoadFixture :: IO SQLiteLoadFixture
+setupSQLiteLoadFixture = do
+  SQLiteFixture backend <- setupSQLiteFixture
+  store <- benchmarkStore backend
+  pure (SQLiteLoadFixture backend store)
+
+
+setupSQLiteSnapshotFixture :: IO SQLiteLoadFixture
+setupSQLiteSnapshotFixture = do
+  fixture@(SQLiteLoadFixture _ store) <- setupSQLiteLoadFixture
+  snapshotEntity store accountKey RetainedHistory >>= requireSnapshot
+  pure fixture
+
+
 setupMemoryRebuildFixture :: IO MemoryFixture
 setupMemoryRebuildFixture = do
   fixture <- setupMemoryFixture
@@ -371,6 +429,10 @@ closeSQLiteReactorFixture (SQLiteReactorFixture store _) =
 closeSQLiteDispatchFixture :: SQLiteDispatchFixture -> IO ()
 closeSQLiteDispatchFixture (SQLiteDispatchFixture backend _) =
   closeSQLiteStore backend
+
+
+closeSQLiteLoadFixture :: SQLiteLoadFixture -> IO ()
+closeSQLiteLoadFixture (SQLiteLoadFixture backend _) = closeSQLiteStore backend
 
 
 consumeMemory :: MemoryFixture -> IO Word64
@@ -554,6 +616,25 @@ executeTypedStoreCommand store command = do
     other -> panic (show other)
 
 
+loadMemoryEntity :: MemoryLoadFixture -> IO Word64
+loadMemoryEntity (MemoryLoadFixture store) = loadBenchmarkEntity store
+
+
+loadSQLiteEntity :: SQLiteLoadFixture -> IO Word64
+loadSQLiteEntity (SQLiteLoadFixture _ store) = loadBenchmarkEntity store
+
+
+loadBenchmarkEntity
+  :: (EventStore backend, Show (BackendError backend))
+  => Store backend Account
+  -> IO Word64
+loadBenchmarkEntity store = do
+  loaded <- loadEntity store accountKey
+  pure case loaded of
+    Right (Just (Account balance)) -> balance
+    other -> panic (show other)
+
+
 benchmarkStore :: backend -> IO (Store backend Account)
 benchmarkStore backend = do
   nextIdentifier <- newIORef (1 :: Word64)
@@ -590,6 +671,15 @@ replicateEvents count = Deposited 1 <$ [1 .. count]
 
 requireRight :: Show error => Either error () -> IO ()
 requireRight = either (panic . show) pure
+
+
+requireSnapshot
+  :: Show (BackendError backend)
+  => Either (StoreError backend Account) (Maybe Account)
+  -> IO ()
+requireSnapshot result = case result of
+  Right (Just _) -> pure ()
+  other -> panic (show other)
 
 
 requireJobEnqueued
