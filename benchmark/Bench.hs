@@ -39,6 +39,10 @@ data AccountApplyError = AccountApplyError
   deriving stock (Eq, Show)
 
 
+data BenchmarkProjectionError = BenchmarkProjectionError
+  deriving stock (Eq, Show)
+
+
 newtype BenchmarkJob = BenchmarkJob ByteString
 
 
@@ -168,6 +172,20 @@ main = do
         "projection"
         [ bench "memory/advance" $
             perRunEnv setupEmptyMemoryFixture advanceMemoryProjection
+        , bench "memory/10000 catch-up" $
+            perRunEnv setupMemoryFixture catchUpMemoryProjection
+        , bench "sqlite/10000 catch-up" $
+            perRunEnvWithCleanup
+              setupSQLiteFixture
+              closeSQLiteFixture
+              catchUpSQLiteProjection
+        , bench "memory/10000 rebuild" $
+            perRunEnv setupMemoryRebuildFixture rebuildMemoryProjection
+        , bench "sqlite/10000 rebuild" $
+            perRunEnvWithCleanup
+              setupSQLiteRebuildFixture
+              closeSQLiteFixture
+              rebuildSQLiteProjection
         ]
     , bgroup
         "commit"
@@ -287,6 +305,20 @@ setupSQLiteDispatchFixture = do
   pure (SQLiteDispatchFixture backend store)
 
 
+setupMemoryRebuildFixture :: IO MemoryFixture
+setupMemoryRebuildFixture = do
+  fixture <- setupMemoryFixture
+  _ <- catchUpMemoryProjection fixture
+  pure fixture
+
+
+setupSQLiteRebuildFixture :: IO SQLiteFixture
+setupSQLiteRebuildFixture = do
+  fixture <- setupSQLiteFixture
+  _ <- catchUpSQLiteProjection fixture
+  pure fixture
+
+
 closeSQLiteFixture :: SQLiteFixture -> IO ()
 closeSQLiteFixture (SQLiteFixture store) = closeSQLiteStore store
 
@@ -375,6 +407,33 @@ advanceMemoryProjection (MemoryFixture store) = do
   pure case advanced of
     Right ProjectionAdvanced -> 1
     other -> panic (show other)
+
+
+catchUpMemoryProjection :: MemoryFixture -> IO Word64
+catchUpMemoryProjection (MemoryFixture store) =
+  requireProjectionResult (catchUpProjection store benchmarkProjection)
+
+
+catchUpSQLiteProjection :: SQLiteFixture -> IO Word64
+catchUpSQLiteProjection (SQLiteFixture store) =
+  requireProjectionResult (catchUpProjection store benchmarkProjection)
+
+
+rebuildMemoryProjection :: MemoryFixture -> IO Word64
+rebuildMemoryProjection (MemoryFixture store) =
+  requireProjectionResult (rebuildProjection store benchmarkProjection)
+
+
+rebuildSQLiteProjection :: SQLiteFixture -> IO Word64
+rebuildSQLiteProjection (SQLiteFixture store) =
+  requireProjectionResult (rebuildProjection store benchmarkProjection)
+
+
+requireProjectionResult
+  :: (Show (BackendError backend), Show projectionError)
+  => IO (Either (ProjectionRunError backend projectionError) Word64)
+  -> IO Word64
+requireProjectionResult action = action >>= either (panic . show) pure
 
 
 commitSQLiteFixture :: SQLiteCommitFixture -> IO Word64
@@ -557,6 +616,27 @@ benchmarkLimits =
 projectionName :: ProjectionName
 projectionName =
   fromMaybe (panic "invalid projection name") (mkProjectionName "benchmark")
+
+
+benchmarkProjection :: Projection Account Word64 BenchmarkProjectionError
+benchmarkProjection =
+  Projection
+    { name = projectionName
+    , initial = 0
+    , apply = applyBenchmarkProjection
+    , encode = LazyByteString.toStrict . Aeson.encode
+    , decode =
+        first (const (DecodeCause "invalid benchmark projection"))
+          . Aeson.eitherDecodeStrict'
+    }
+
+
+applyBenchmarkProjection
+  :: Word64 -> AccountEvent -> Either BenchmarkProjectionError Word64
+applyBenchmarkProjection balance event = case event of
+  Opened amount -> Right (balance + amount)
+  Deposited amount -> Right (balance + amount)
+  NotificationQueued _ -> Right balance
 
 
 benchmarkJobId :: JobId
