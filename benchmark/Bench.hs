@@ -129,6 +129,7 @@ instance NFData SQLiteLoadFixture where
 instance Job BenchmarkJob where
   jobType _ = "benchmark-job"
   encodeJob (BenchmarkJob payload) = payload
+  decodeJob = Right . BenchmarkJob
 
 
 instance Dispatches Account BenchmarkJob where

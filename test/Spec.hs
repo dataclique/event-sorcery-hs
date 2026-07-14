@@ -3,6 +3,7 @@ module Main (main) where
 import Conduit (runConduit, sinkList, (.|))
 import Data.Aeson qualified as Aeson
 import Data.ByteString.Lazy qualified as LazyByteString
+import Data.IORef
 import EventSorcery
 import EventSorcery.Aggregate qualified as Aggregate
 import EventSorcery.Backend.Memory
@@ -69,6 +70,68 @@ newtype EmailJob = EmailJob Text
 instance Job EmailJob where
   jobType _ = "email"
   encodeJob (EmailJob recipient) = encodeUtf8 recipient
+  decodeJob = Right . EmailJob . decodeUtf8
+
+
+data ProbeSubmission
+  = SubmitSucceeds
+  | SubmitTransientlyFails
+  | SubmitTerminallyFails
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (Aeson.FromJSON, Aeson.ToJSON)
+
+
+data ProbeReconciliation
+  = ReconcileAsNotSubmitted
+  | ReconcileAsIndeterminate
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (Aeson.FromJSON, Aeson.ToJSON)
+
+
+data ProbeJob = ProbeJob ProbeSubmission ProbeReconciliation
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (Aeson.FromJSON, Aeson.ToJSON)
+
+
+data ProbeInvocation
+  = SubmitInvoked
+  | ReconcileInvoked
+  deriving stock (Eq, Show)
+
+
+newtype ProbeInput = ProbeInput (IORef [ProbeInvocation])
+
+
+data ProbeFailure = ProbeFailure
+  deriving stock (Eq, Show)
+
+
+instance Job ProbeJob where
+  jobType _ = "probe"
+  encodeJob = LazyByteString.toStrict . Aeson.encode
+  decodeJob =
+    first (const (DecodeCause "invalid probe job")) . Aeson.eitherDecodeStrict'
+
+
+instance DurableJob ProbeJob where
+  type JobInput ProbeJob = ProbeInput
+  type JobOutput ProbeJob = Text
+  type JobFailureCause ProbeJob = ProbeFailure
+
+
+  submitJob _ input (ProbeJob submission _) = do
+    recordProbeInvocation input SubmitInvoked
+    pure case submission of
+      SubmitSucceeds -> Right (JobDone "submitted")
+      SubmitTransientlyFails -> Left (Transient ProbeFailure)
+      SubmitTerminallyFails -> Left (Terminal ProbeFailure)
+
+
+  reconcileJob _ input (ProbeJob _ reconciliation) = do
+    recordProbeInvocation input ReconcileInvoked
+    pure case reconciliation of
+      ReconcileAsNotSubmitted -> Right NotSubmitted
+      ReconcileAsIndeterminate -> Right (Indeterminate (LeaseInstant 40))
 
 
 instance Dispatches Account EmailJob where
@@ -207,6 +270,8 @@ main = hspec do
   deliveryStoreContract "SQLite delivery store" withSQLiteStore
   jobStoreContract "in-memory job store" withMemoryStore
   jobStoreContract "SQLite job store" withSQLiteStore
+  jobRuntimeContract "in-memory job runtime" withMemoryStore
+  jobRuntimeContract "SQLite job runtime" withSQLiteStore
   reactorStoreContract "in-memory reactor store" withMemoryStore
   reactorStoreContract "SQLite reactor store" withSQLiteStore
   schemaStoreContract "in-memory schema store" withMemoryStore
@@ -465,13 +530,13 @@ jobStoreContract label withStore = describe label do
       enqueueJob store jobId "payload" `shouldReturn` Right JobEnqueued
       claimJob store jobId firstLease
         `shouldReturn` Right
-          (JobClaim (LeaseToken 1) (AttemptCount 1) "payload")
+          (JobClaim (LeaseToken 1) (AttemptCount 0) "payload")
       claimJob store jobId overlappingLease
         `shouldReturn` Left
           (JobLeaseUnavailable jobId (LeaseInstant 20))
       claimJob store jobId replacementLease
         `shouldReturn` Right
-          (JobClaim (LeaseToken 2) (AttemptCount 2) "payload")
+          (JobClaim (LeaseToken 2) (AttemptCount 0) "payload")
       acknowledgeJob store jobId (LeaseToken 1)
         `shouldReturn` Left
           (JobLeaseLost jobId (LeaseToken 1) (LeaseToken 2))
@@ -479,6 +544,148 @@ jobStoreContract label withStore = describe label do
       acknowledgeJob store jobId (LeaseToken 2) `shouldReturn` Right ()
       claimJob store jobId completedLease
         `shouldReturn` Left (JobAlreadyCompleted jobId)
+
+  it "defers without an attempt and counts only transient failures" $
+    withStore \store -> do
+      enqueueJob store jobId "payload" `shouldReturn` Right JobEnqueued
+      claimJob store jobId firstLease
+        `shouldReturn` Right
+          (JobClaim (LeaseToken 1) (AttemptCount 0) "payload")
+      deferJob store jobId (LeaseToken 1) (LeaseInstant 30)
+        `shouldReturn` Right ()
+      claimJob store jobId replacementLease
+        `shouldReturn` Left (JobNotRunnable jobId (LeaseInstant 30))
+      claimJob store jobId completedLease
+        `shouldReturn` Right
+          (JobClaim (LeaseToken 2) (AttemptCount 0) "payload")
+      retryJob store jobId (LeaseToken 2) (LeaseInstant 50)
+        `shouldReturn` Right (AttemptCount 1)
+      claimJob store jobId (leaseWindow 40 60)
+        `shouldReturn` Left (JobNotRunnable jobId (LeaseInstant 50))
+      claimJob store jobId (leaseWindow 50 60)
+        `shouldReturn` Right
+          (JobClaim (LeaseToken 3) (AttemptCount 1) "payload")
+      deadLetterJob store jobId (LeaseToken 3) Rejected
+        `shouldReturn` Right ()
+      claimJob store jobId (leaseWindow 60 70)
+        `shouldReturn` Left (JobAlreadyDeadLettered jobId Rejected)
+      history <- loadStream store jobIdentity
+      fmap (fmap (.metadata.eventType)) history
+        `shouldBe` Right
+          [ "enqueued"
+          , "claimed"
+          , "deferred"
+          , "claimed"
+          , "retry-scheduled"
+          , "claimed"
+          , "dead-lettered"
+          ]
+
+
+jobRuntimeContract
+  :: forall backend
+   . ( Eq (BackendError backend)
+     , JobStore backend
+     , Show (BackendError backend)
+     )
+  => [Char]
+  -> (forall result. (backend -> IO result) -> IO result)
+  -> Spec
+jobRuntimeContract label withStore = describe label do
+  it "reconciles a later claim before an authorized resubmission" $
+    withStore \store -> do
+      invocations <- newIORef []
+      let runtime = mkJobRuntime store testAttemptLimit retrySchedule
+          input = ProbeInput invocations
+          job = ProbeJob SubmitSucceeds ReconcileAsNotSubmitted
+      enqueueDurableJob runtime jobId job `shouldReturn` Right JobEnqueued
+      ambiguous <- claimJob store jobId firstLease
+      ambiguous `shouldSatisfy` isRight
+      runJobOnce (Proxy @ProbeJob) runtime input jobId replacementLease
+        `shouldReturn` Right (JobSucceeded "submitted")
+      readIORef invocations
+        `shouldReturn` [ReconcileInvoked, SubmitInvoked]
+
+  it "defers an indeterminate reconciliation without resubmitting" $
+    withStore \store -> do
+      invocations <- newIORef []
+      let runtime = mkJobRuntime store testAttemptLimit retrySchedule
+          input = ProbeInput invocations
+          job = ProbeJob SubmitSucceeds ReconcileAsIndeterminate
+      enqueueDurableJob runtime jobId job `shouldReturn` Right JobEnqueued
+      ambiguous <- claimJob store jobId firstLease
+      ambiguous `shouldSatisfy` isRight
+      runJobOnce (Proxy @ProbeJob) runtime input jobId replacementLease
+        `shouldReturn` Right (JobDeferred (LeaseInstant 40))
+      readIORef invocations `shouldReturn` [ReconcileInvoked]
+      claimJob store jobId (leaseWindow 30 50)
+        `shouldReturn` Left (JobNotRunnable jobId (LeaseInstant 40))
+
+  it "classifies terminal failures as retained dead letters" $
+    withStore \store -> do
+      invocations <- newIORef []
+      let runtime = mkJobRuntime store testAttemptLimit retrySchedule
+          input = ProbeInput invocations
+          job = ProbeJob SubmitTerminallyFails ReconcileAsNotSubmitted
+      enqueueDurableJob runtime jobId job `shouldReturn` Right JobEnqueued
+      runJobOnce (Proxy @ProbeJob) runtime input jobId firstLease
+        `shouldReturn` Right (JobRejected ProbeFailure)
+      claimJob store jobId replacementLease
+        `shouldReturn` Left (JobAlreadyDeadLettered jobId Rejected)
+
+  it "dead-letters a transient failure when its retry budget is exhausted" $
+    withStore \store -> do
+      invocations <- newIORef []
+      let runtime = mkJobRuntime store singleAttemptLimit retrySchedule
+          input = ProbeInput invocations
+          job = ProbeJob SubmitTransientlyFails ReconcileAsNotSubmitted
+      enqueueDurableJob runtime jobId job `shouldReturn` Right JobEnqueued
+      runJobOnce (Proxy @ProbeJob) runtime input jobId firstLease
+        `shouldReturn` Right
+          (JobRetriesExhausted (AttemptCount 1) ProbeFailure)
+      claimJob store jobId replacementLease
+        `shouldReturn` Left
+          (JobAlreadyDeadLettered jobId RetriesExhausted)
+
+  it "reconciles after a scheduled transient retry" $
+    withStore \store -> do
+      invocations <- newIORef []
+      let runtime = mkJobRuntime store testAttemptLimit retrySchedule
+          input = ProbeInput invocations
+          job = ProbeJob SubmitTransientlyFails ReconcileAsNotSubmitted
+      enqueueDurableJob runtime jobId job `shouldReturn` Right JobEnqueued
+      runJobOnce (Proxy @ProbeJob) runtime input jobId firstLease
+        `shouldReturn` Right
+          ( JobRetryScheduled
+              (AttemptCount 1)
+              (LeaseInstant 41)
+              ProbeFailure
+          )
+      claimJob store jobId replacementLease
+        `shouldReturn` Left (JobNotRunnable jobId (LeaseInstant 41))
+      runJobOnce
+        (Proxy @ProbeJob)
+        runtime
+        input
+        jobId
+        (leaseWindow 41 50)
+        `shouldReturn` Right
+          (JobRetriesExhausted (AttemptCount 2) ProbeFailure)
+      readIORef invocations
+        `shouldReturn` [SubmitInvoked, ReconcileInvoked, SubmitInvoked]
+
+  it "dead-letters an undecodable payload without exposing it" $
+    withStore \store -> do
+      invocations <- newIORef []
+      let runtime = mkJobRuntime store testAttemptLimit retrySchedule
+          input = ProbeInput invocations
+      enqueueJob store jobId "sensitive malformed payload"
+        `shouldReturn` Right JobEnqueued
+      runJobOnce (Proxy @ProbeJob) runtime input jobId firstLease
+        `shouldReturn` Left
+          (JobRunDecodeFailed jobId (DecodeCause "invalid stored job"))
+      claimJob store jobId replacementLease
+        `shouldReturn` Left (JobAlreadyDeadLettered jobId Undecodable)
 
 
 reactorStoreContract
@@ -535,7 +742,7 @@ reactorStoreContract label withStore = describe label do
 storeContract
   :: forall backend
    . ( Eq (BackendError backend)
-     , EventStore backend
+     , JobStore backend
      , Show (BackendError backend)
      )
   => [Char]
@@ -577,6 +784,9 @@ storeContract label withBackend = describe label do
       fmap (fmap (.metadata)) jobEvents
         `shouldBe` Right
           [EventMetadata "job" "job-1" "enqueued" (EventVersion 1)]
+      claimed <- claimJob backend jobId firstLease
+      fmap (\(JobClaim token attempts _) -> (token, attempts)) claimed
+        `shouldBe` Right (LeaseToken 1, AttemptCount 0)
 
   it "leaves the origin unchanged when the job stream conflicts" $
     withBackend \backend -> do
@@ -850,6 +1060,25 @@ leaseWindow claimedAt expiresAt =
   fromMaybe
     (panic "invalid lease window")
     (mkLeaseWindow (LeaseInstant claimedAt) (LeaseInstant expiresAt))
+
+
+testAttemptLimit :: AttemptLimit
+testAttemptLimit =
+  fromMaybe (panic "invalid attempt limit") (mkAttemptLimit 2)
+
+
+singleAttemptLimit :: AttemptLimit
+singleAttemptLimit =
+  fromMaybe (panic "invalid attempt limit") (mkAttemptLimit 1)
+
+
+retrySchedule :: AttemptCount -> LeaseInstant
+retrySchedule (AttemptCount attempt) = LeaseInstant (40 + attempt)
+
+
+recordProbeInvocation :: ProbeInput -> ProbeInvocation -> IO ()
+recordProbeInvocation (ProbeInput invocations) invocation =
+  modifyIORef' invocations (<> [invocation])
 
 
 firstProjectionUpdate :: ProjectionUpdate

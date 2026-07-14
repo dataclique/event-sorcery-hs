@@ -42,6 +42,7 @@ data DispatchIntent job = DispatchIntent JobId Text ByteString
 class Job job where
   jobType :: Proxy job -> Text
   encodeJob :: job -> ByteString
+  decodeJob :: ByteString -> Either DecodeCause job
 
 
 class Dispatches entity job where

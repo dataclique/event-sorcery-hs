@@ -42,6 +42,7 @@ data SQLiteError
   | SQLiteCommitFailed SQLiteFailure
   | SQLiteStoredDataInvalid
   | SQLiteSnapshotVersionInvalid
+  | SQLiteJobPayloadMismatch JobId
   deriving stock (Eq, Show)
 
 
@@ -246,6 +247,66 @@ instance JobStore SQLiteStore where
             (acknowledgeJobTransaction connection identifier token)
         )
     pure (sqliteJobResult acknowledged)
+
+
+  retryJob store@(SQLiteStore connection _) identifier token runAt = do
+    retried <-
+      trySQLite
+        ( withSQLiteTransaction
+            store
+            ( transitionJobRecord
+                connection
+                identifier
+                JobRetryScheduledEvent
+                (decideRetry identifier token runAt)
+            )
+        )
+    pure (sqliteJobResult retried)
+
+
+  deferJob store@(SQLiteStore connection _) identifier token runAt = do
+    deferred <-
+      trySQLite
+        ( withSQLiteTransaction
+            store
+            ( transitionJobRecord
+                connection
+                identifier
+                JobDeferredEvent
+                (fmap ((),) . decideDefer identifier token runAt)
+            )
+        )
+    pure (sqliteJobResult deferred)
+
+
+  deadLetterJob store@(SQLiteStore connection _) identifier token reason = do
+    deadLettered <-
+      trySQLite
+        ( withSQLiteTransaction
+            store
+            ( transitionJobRecord
+                connection
+                identifier
+                JobDeadLetteredEvent
+                (fmap ((),) . decideDeadLetter identifier token reason)
+            )
+        )
+    pure (sqliteJobResult deadLettered)
+
+
+  exhaustJob store@(SQLiteStore connection _) identifier token = do
+    exhausted <-
+      trySQLite
+        ( withSQLiteTransaction
+            store
+            ( transitionJobRecord
+                connection
+                identifier
+                JobDeadLetteredEvent
+                (decideExhaust identifier token)
+            )
+        )
+    pure (sqliteJobResult exhausted)
 
 
 instance ReactorStore SQLiteStore where
@@ -775,9 +836,14 @@ enqueueJobTransaction connection identifier payload = do
   current <- loadJobRecord connection identifier
   case current >>= decideEnqueue identifier payload of
     Left failure -> pure (Left failure)
-    Right (result, next) -> do
-      traverse_ (storeJobRecord connection identifier) next
-      pure (Right result)
+    Right (JobAlreadyEnqueued, _) -> pure (Right JobAlreadyEnqueued)
+    Right (JobEnqueued, next) -> do
+      storeSQLiteJobEvent
+        connection
+        identifier
+        JobEnqueuedEvent
+        next
+      pure (Right JobEnqueued)
 
 
 claimJobTransaction
@@ -790,7 +856,7 @@ claimJobTransaction connection identifier window = do
   case current >>= decideClaim identifier window of
     Left failure -> pure (Left failure)
     Right (claim, next) -> do
-      storeJobRecord connection identifier next
+      storeSQLiteJobEvent connection identifier JobClaimedEvent next
       pure (Right claim)
 
 
@@ -804,8 +870,65 @@ acknowledgeJobTransaction connection identifier token = do
   case current >>= decideAcknowledge identifier token of
     Left failure -> pure (Left failure)
     Right next -> do
-      storeJobRecord connection identifier next
+      storeChangedSQLiteJobEvent
+        connection
+        identifier
+        JobSucceededEvent
+        current
+        next
       pure (Right ())
+
+
+transitionJobRecord
+  :: Connection
+  -> JobId
+  -> JobLifecycleEvent
+  -> ( Maybe JobRecord
+       -> Either (JobError SQLiteStore) (result, JobRecord)
+     )
+  -> IO (Either (JobError SQLiteStore) result)
+transitionJobRecord connection identifier lifecycle decide = do
+  current <- loadJobRecord connection identifier
+  case current >>= decide of
+    Left failure -> pure (Left failure)
+    Right (result, next) -> do
+      storeChangedSQLiteJobEvent
+        connection
+        identifier
+        lifecycle
+        current
+        next
+      pure (Right result)
+
+
+storeChangedSQLiteJobEvent
+  :: Connection
+  -> JobId
+  -> JobLifecycleEvent
+  -> Either (JobError SQLiteStore) (Maybe JobRecord)
+  -> JobRecord
+  -> IO ()
+storeChangedSQLiteJobEvent connection identifier lifecycle current next =
+  unless (current == Right (Just next)) do
+    storeSQLiteJobEvent connection identifier lifecycle next
+
+
+storeSQLiteJobEvent
+  :: Connection
+  -> JobId
+  -> JobLifecycleEvent
+  -> JobRecord
+  -> IO ()
+storeSQLiteJobEvent connection identifier lifecycle record = do
+  let jobIdentity = StreamIdentity "job" (Aggregate.jobIdText identifier)
+  actual <- currentSQLiteVersion connection jobIdentity
+  insertValidatedAppend
+    connection
+    ( ValidatedAppend
+        actual
+        (jobEventAppend identifier actual lifecycle record)
+    )
+  storeJobRecord connection identifier record
 
 
 loadJobRecord
@@ -831,8 +954,14 @@ decodeJobRow :: JobRow -> Either (JobError SQLiteStore) JobRecord
 decodeJobRow (JobRow payload status token expires attempts) = do
   decodedStatus <- case (status, expires) of
     ("ready", Nothing) -> Right JobReady
+    ("scheduled", Just runAt) -> Right (JobScheduled (LeaseInstant runAt))
     ("leased", Just expiresAt) -> Right (JobLeased (LeaseInstant expiresAt))
     ("completed", Nothing) -> Right JobCompleted
+    ("dead-retries-exhausted", Nothing) ->
+      Right (JobDeadLettered RetriesExhausted)
+    ("dead-rejected", Nothing) -> Right (JobDeadLettered Rejected)
+    ("dead-undecodable", Nothing) -> Right (JobDeadLettered Undecodable)
+    ("dead-abandoned", Nothing) -> Right (JobDeadLettered Abandoned)
     _ -> Left (JobBackendFailed SQLiteStoredDataInvalid)
   pure
     ( JobRecord
@@ -879,15 +1008,22 @@ storeJobRecord
 statusText :: JobStatus -> Text
 statusText status = case status of
   JobReady -> "ready"
+  JobScheduled _ -> "scheduled"
   JobLeased _ -> "leased"
   JobCompleted -> "completed"
+  JobDeadLettered RetriesExhausted -> "dead-retries-exhausted"
+  JobDeadLettered Rejected -> "dead-rejected"
+  JobDeadLettered Undecodable -> "dead-undecodable"
+  JobDeadLettered Abandoned -> "dead-abandoned"
 
 
 leaseExpiry :: JobStatus -> Maybe Word64
 leaseExpiry status = case status of
+  JobScheduled (LeaseInstant runAt) -> Just runAt
   JobLeased (LeaseInstant expiresAt) -> Just expiresAt
   JobReady -> Nothing
   JobCompleted -> Nothing
+  JobDeadLettered _ -> Nothing
 
 
 sqliteJobResult
@@ -1082,7 +1218,10 @@ validateAppends connection = runExceptT . traverse validate
           (currentSQLiteVersion connection (streamAppendIdentity append))
       let expected = streamAppendExpectedVersion append
       if expected == actual
-        then pure (ValidatedAppend actual append)
+        then do
+          validatedJob <- liftIO (validateSQLiteJobSeed connection append)
+          either throwError pure validatedJob
+          pure (ValidatedAppend actual append)
         else
           throwError
             (ConcurrencyConflict (streamAppendIdentity append) expected actual)
@@ -1110,6 +1249,7 @@ insertValidatedAppend connection (ValidatedAppend actual append) = do
         NoStream -> 1
         At (StreamVersion version) -> version + 1
   traverse_ (uncurry insertEvent) (zip [firstPosition ..] events)
+  traverse_ (uncurry (seedSQLiteJob connection)) (frameworkJobSeed append)
   where
     StreamIdentity aggregateName identifier =
       streamAppendIdentity append
@@ -1134,3 +1274,30 @@ insertValidatedAppend connection (ValidatedAppend actual append) = do
         , case metadata.eventVersion of EventVersion version -> version
         , payload
         )
+
+
+validateSQLiteJobSeed
+  :: Connection
+  -> StreamAppend
+  -> IO (Either (CommitError SQLiteStore) ())
+validateSQLiteJobSeed connection append = case frameworkJobSeed append of
+  Nothing -> pure (Right ())
+  Just (_, Left _) -> pure (Left (BackendFailed SQLiteStoredDataInvalid))
+  Just (identifier, Right record) -> do
+    current <- loadJobRecord connection identifier
+    pure case current of
+      Left _ -> Left (BackendFailed SQLiteStoredDataInvalid)
+      Right Nothing -> Right ()
+      Right (Just stored)
+        | stored == record -> Right ()
+        | otherwise -> Left (BackendFailed (SQLiteJobPayloadMismatch identifier))
+
+
+seedSQLiteJob
+  :: Connection
+  -> JobId
+  -> Either Aggregate.DecodeCause JobRecord
+  -> IO ()
+seedSQLiteJob _ _ (Left _) = pure ()
+seedSQLiteJob connection identifier (Right record) =
+  storeJobRecord connection identifier record

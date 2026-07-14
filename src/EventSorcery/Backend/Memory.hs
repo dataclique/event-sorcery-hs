@@ -16,7 +16,7 @@ import Data.List.NonEmpty qualified as NonEmpty
 import Data.Map.Strict qualified as Map
 import Data.Sequence qualified as Seq
 import Data.Set qualified as Set
-import EventSorcery.Aggregate (SchemaVersion)
+import EventSorcery.Aggregate (SchemaVersion, jobIdText)
 import EventSorcery.Delivery.Internal
 import EventSorcery.Job.Internal
 import EventSorcery.Projection.Internal
@@ -48,7 +48,10 @@ data MemoryReactorState
       (Map.Map DeliveryId OutboxEntry)
 
 
-data MemoryError = MemorySnapshotVersionInvalid
+data MemoryError
+  = MemorySnapshotVersionInvalid
+  | MemoryJobPayloadMismatch JobId
+  | MemoryStoredJobStateInvalid
   deriving stock (Eq, Show)
 
 
@@ -148,10 +151,12 @@ instance DeliveryStore MemoryStore where
           then pure (Right DeliveryAlreadyApplied)
           else case validateExpectedVersions current.streams appends of
             Left conflict -> pure (Left conflict)
-            Right () -> do
-              let committed = foldl' applyAppend current appends
-              writeTVar memoryState (recordDelivery delivery committed)
-              pure (Right DeliveryApplied)
+            Right () -> case validateMemoryJobSeeds current.jobs appends of
+              Left failure -> pure (Left failure)
+              Right () -> do
+                let committed = foldl' applyAppend current appends
+                writeTVar memoryState (recordDelivery delivery committed)
+                pure (Right DeliveryApplied)
 
 
 instance JobStore MemoryStore where
@@ -159,9 +164,15 @@ instance JobStore MemoryStore where
     current <- readTVar memoryState
     case decideEnqueue identifier payload (Map.lookup identifier current.jobs) of
       Left failure -> pure (Left failure)
-      Right (result, next) -> do
-        traverse_ (writeJob memoryState current identifier) next
-        pure (Right result)
+      Right (JobAlreadyEnqueued, _) -> pure (Right JobAlreadyEnqueued)
+      Right (JobEnqueued, next) -> do
+        writeMemoryJobEvent
+          memoryState
+          current
+          identifier
+          JobEnqueuedEvent
+          next
+        pure (Right JobEnqueued)
 
 
   claimJob (MemoryStore memoryState) identifier window = atomically do
@@ -169,7 +180,12 @@ instance JobStore MemoryStore where
     case decideClaim identifier window (Map.lookup identifier current.jobs) of
       Left failure -> pure (Left failure)
       Right (claim, next) -> do
-        writeJob memoryState current identifier next
+        writeMemoryJobEvent
+          memoryState
+          current
+          identifier
+          JobClaimedEvent
+          next
         pure (Right claim)
 
 
@@ -178,8 +194,45 @@ instance JobStore MemoryStore where
     case decideAcknowledge identifier token (Map.lookup identifier current.jobs) of
       Left failure -> pure (Left failure)
       Right next -> do
-        writeJob memoryState current identifier next
+        writeChangedMemoryJobEvent
+          memoryState
+          current
+          identifier
+          JobSucceededEvent
+          next
         pure (Right ())
+
+
+  retryJob (MemoryStore memoryState) identifier token runAt =
+    transitionMemoryJob
+      memoryState
+      identifier
+      JobRetryScheduledEvent
+      (decideRetry identifier token runAt)
+
+
+  deferJob (MemoryStore memoryState) identifier token runAt =
+    transitionMemoryJob
+      memoryState
+      identifier
+      JobDeferredEvent
+      (fmap ((),) . decideDefer identifier token runAt)
+
+
+  deadLetterJob (MemoryStore memoryState) identifier token reason =
+    transitionMemoryJob
+      memoryState
+      identifier
+      JobDeadLetteredEvent
+      (fmap ((),) . decideDeadLetter identifier token reason)
+
+
+  exhaustJob (MemoryStore memoryState) identifier token =
+    transitionMemoryJob
+      memoryState
+      identifier
+      JobDeadLetteredEvent
+      (decideExhaust identifier token)
 
 
 instance ReactorStore MemoryStore where
@@ -254,9 +307,11 @@ commitAppends (MemoryStore streams) appends = atomically do
   memoryState <- readTVar streams
   case validateExpectedVersions memoryState.streams appends of
     Left conflict -> pure (Left conflict)
-    Right () -> do
-      writeTVar streams (foldl' applyAppend memoryState appends)
-      pure (Right ())
+    Right () -> case validateMemoryJobSeeds memoryState.jobs appends of
+      Left failure -> pure (Left failure)
+      Right () -> do
+        writeTVar streams (foldl' applyAppend memoryState appends)
+        pure (Right ())
 
 
 loadMemoryStream :: StreamIdentity -> MemoryState -> [StoredEvent]
@@ -354,6 +409,7 @@ applyAppend memoryState append =
           (existing <> Seq.fromList storedEvents)
           memoryState.streams
     , eventJournal = memoryState.eventJournal <> Seq.fromList envelopes
+    , jobs = seedMemoryJob append memoryState.jobs
     }
   where
     streamIdentity = streamAppendIdentity append
@@ -378,6 +434,34 @@ applyAppend memoryState append =
       StoredEvent (StreamPosition position) metadata payload
 
 
+validateMemoryJobSeeds
+  :: Map.Map JobId JobRecord
+  -> NonEmpty StreamAppend
+  -> Either (CommitError MemoryStore) ()
+validateMemoryJobSeeds jobs = traverse_ validate
+  where
+    validate append = case frameworkJobSeed append of
+      Nothing -> Right ()
+      Just (_, Left _) -> Left (BackendFailed MemoryStoredJobStateInvalid)
+      Just (identifier, Right record) ->
+        case Map.lookup identifier jobs of
+          Nothing -> Right ()
+          Just stored
+            | stored == record -> Right ()
+            | otherwise ->
+                Left (BackendFailed (MemoryJobPayloadMismatch identifier))
+
+
+seedMemoryJob
+  :: StreamAppend
+  -> Map.Map JobId JobRecord
+  -> Map.Map JobId JobRecord
+seedMemoryJob append jobs = case frameworkJobSeed append of
+  Nothing -> jobs
+  Just (_, Left _) -> jobs
+  Just (identifier, Right record) -> Map.insert identifier record jobs
+
+
 memoryVersion :: Seq.Seq StoredEvent -> ExpectedVersion
 memoryVersion events = case Seq.viewr events of
   Seq.EmptyR -> NoStream
@@ -395,20 +479,62 @@ recordDelivery delivery memoryState =
     }
 
 
-writeJob
+writeMemoryJobEvent
   :: TVar MemoryState
   -> MemoryState
   -> JobId
+  -> JobLifecycleEvent
   -> JobRecord
   -> STM ()
-writeJob
+writeMemoryJobEvent
   memoryState
   current
   identifier
+  lifecycle
   record =
-    writeTVar
-      memoryState
-      current {jobs = Map.insert identifier record current.jobs}
+    writeTVar memoryState next
+    where
+      jobIdentity = StreamIdentity "job" (jobIdText identifier)
+      expected =
+        memoryVersion
+          (Map.findWithDefault Seq.empty jobIdentity current.streams)
+      appended =
+        applyAppend current (jobEventAppend identifier expected lifecycle record)
+      next = appended {jobs = Map.insert identifier record appended.jobs}
+
+
+writeChangedMemoryJobEvent
+  :: TVar MemoryState
+  -> MemoryState
+  -> JobId
+  -> JobLifecycleEvent
+  -> JobRecord
+  -> STM ()
+writeChangedMemoryJobEvent memoryState current identifier lifecycle next =
+  unless (Map.lookup identifier current.jobs == Just next) do
+    writeMemoryJobEvent memoryState current identifier lifecycle next
+
+
+transitionMemoryJob
+  :: TVar MemoryState
+  -> JobId
+  -> JobLifecycleEvent
+  -> ( Maybe JobRecord
+       -> Either (JobError MemoryStore) (result, JobRecord)
+     )
+  -> IO (Either (JobError MemoryStore) result)
+transitionMemoryJob memoryState identifier lifecycle decide = atomically do
+  current <- readTVar memoryState
+  case decide (Map.lookup identifier current.jobs) of
+    Left failure -> pure (Left failure)
+    Right (result, next) -> do
+      writeChangedMemoryJobEvent
+        memoryState
+        current
+        identifier
+        lifecycle
+        next
+      pure (Right result)
 
 
 updateMemoryReactor

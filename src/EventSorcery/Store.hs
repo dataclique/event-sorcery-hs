@@ -35,10 +35,16 @@ module EventSorcery.Store (
   streamAppendIdentity,
 ) where
 
-import Data.ByteString qualified as ByteString
-import Data.ByteString.Builder qualified as Builder
-import Data.ByteString.Lazy qualified as LazyByteString
 import EventSorcery.Aggregate
+import EventSorcery.Job.Internal (
+  AttemptCount (..),
+  JobLifecycleEvent (..),
+  JobRecord (..),
+  JobStatus (..),
+  LeaseToken (..),
+  encodeStoredJob,
+  jobEventAppend,
+ )
 import EventSorcery.Store.Internal
 import EventSorcery.Stream
 import Protolude
@@ -336,27 +342,11 @@ classifyConflict _ _ = UnknownStreamConflict
 
 frameworkJobAppend :: Job job => JobId -> job -> StreamAppend
 frameworkJobAppend identifier job =
-  StreamAppend
-    jobStreamIdentity
-    NoStream
-    ( ProposedEvent
-        (EventMetadata "job" encodedId "enqueued" (EventVersion 1))
-        (encodeFrameworkJob job)
-        :| []
-    )
+  jobEventAppend identifier NoStream JobEnqueuedEvent initialRecord
   where
-    encodedId = jobIdText identifier
-    jobStreamIdentity = StreamIdentity "job" encodedId
-
-
-encodeFrameworkJob :: forall job. Job job => job -> ByteString
-encodeFrameworkJob job =
-  LazyByteString.toStrict
-    ( Builder.toLazyByteString
-        ( Builder.word64BE (fromIntegral (ByteString.length jobTypeBytes))
-            <> Builder.byteString jobTypeBytes
-            <> Builder.byteString (encodeJob job)
-        )
-    )
-  where
-    jobTypeBytes = encodeUtf8 (jobType (Proxy @job))
+    initialRecord =
+      JobRecord
+        (encodeStoredJob job)
+        JobReady
+        (LeaseToken 0)
+        (AttemptCount 0)

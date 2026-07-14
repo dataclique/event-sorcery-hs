@@ -72,6 +72,7 @@ library
   hs-source-dirs:  src
   build-depends:
     , base           >=4.18  && <5
+    , binary         >=0.8   && <0.9
     , bytestring     >=0.11  && <0.13
     , conduit        >=1.3.6 && <1.4
     , containers     >=0.6   && <0.9
