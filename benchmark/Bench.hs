@@ -5,6 +5,7 @@ import Criterion.Main
 import Data.Aeson qualified as Aeson
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Lazy qualified as LazyByteString
+import Data.IORef (atomicModifyIORef', newIORef)
 import EventSorcery
 import EventSorcery.Aggregate qualified as Aggregate
 import EventSorcery.Backend.Memory
@@ -16,22 +17,29 @@ newtype AccountId = AccountId Text
 
 
 newtype Account = Account Word64
+  deriving stock (Eq, Show)
 
 
-data AccountCommand = Open
+data AccountCommand = Open | Notify
 
 
 data AccountEvent
   = Opened Word64
   | Deposited Word64
+  | NotificationQueued Text
   deriving stock (Generic)
   deriving anyclass (Aeson.FromJSON, Aeson.ToJSON)
 
 
 data AccountCommandError = AccountCommandError
+  deriving stock (Eq, Show)
 
 
 data AccountApplyError = AccountApplyError
+  deriving stock (Eq, Show)
+
+
+newtype BenchmarkJob = BenchmarkJob ByteString
 
 
 newtype MemoryFixture = MemoryFixture MemoryStore
@@ -53,6 +61,13 @@ data MemoryReactorFixture = MemoryReactorFixture MemoryStore [Word64]
 
 
 data SQLiteReactorFixture = SQLiteReactorFixture SQLiteStore [Word64]
+
+
+newtype MemoryDispatchFixture = MemoryDispatchFixture (Store MemoryStore Account)
+
+
+data SQLiteDispatchFixture
+  = SQLiteDispatchFixture SQLiteStore (Store SQLiteStore Account)
 
 
 instance NFData MemoryFixture where
@@ -83,19 +98,38 @@ instance NFData SQLiteReactorFixture where
   rnf (SQLiteReactorFixture store offsets) = store `seq` rnf offsets
 
 
+instance NFData MemoryDispatchFixture where
+  rnf (MemoryDispatchFixture store) = store `seq` ()
+
+
+instance NFData SQLiteDispatchFixture where
+  rnf (SQLiteDispatchFixture backend store) = backend `seq` store `seq` ()
+
+
+instance Job BenchmarkJob where
+  jobType _ = "benchmark-job"
+  encodeJob (BenchmarkJob payload) = payload
+
+
+instance Dispatches Account BenchmarkJob where
+  injectDispatchIntent intent =
+    NotificationQueued (jobIdText (dispatchJobId intent))
+
+
 instance EventSourced Account where
   type EntityId Account = AccountId
   type Command Account = AccountCommand
   type Event Account = AccountEvent
   type CommandError Account = AccountCommandError
   type ApplyError Account = AccountApplyError
-  type Jobs Account = '[]
+  type Jobs Account = '[BenchmarkJob]
 
 
   aggregateType _ = "benchmark-account"
   encodeEntityId (AccountId identifier) = identifier
   eventType (Opened _) = "opened"
   eventType (Deposited _) = "deposited"
+  eventType (NotificationQueued _) = "notification-queued"
   eventVersion _ = EventVersion 1
   schemaVersion _ = SchemaVersion 1
   encodeEvent = LazyByteString.toStrict . Aeson.encode
@@ -104,11 +138,15 @@ instance EventSourced Account where
       . Aeson.eitherDecodeStrict'
   originate (Opened amount) = Right (Account amount)
   originate (Deposited _) = Left AccountApplyError
+  originate (NotificationQueued _) = Left AccountApplyError
   evolve (Account balance) (Deposited amount) =
     Right (Account (balance + amount))
   evolve account (Opened _) = Right account
+  evolve account (NotificationQueued _) = Right account
   initialize Open = Right (Events (Opened 0 :| []))
+  initialize Notify = Left AccountCommandError
   transition _ Open = Left AccountCommandError
+  transition _ Notify = Right (Dispatch (BenchmarkJob "payload"))
 
 
 main :: IO ()
@@ -158,6 +196,23 @@ main = do
               setupSQLiteReactorFixture
               closeSQLiteReactorFixture
               advanceSQLiteReactor
+        ]
+    , bgroup
+        "typed-store"
+        [ bench "memory/initialize" $
+            perRunEnv setupEmptyMemoryFixture executeMemoryOpen
+        , bench "sqlite/initialize" $
+            perRunEnvWithCleanup
+              setupEmptySQLiteFixture
+              closeSQLiteFixture
+              executeSQLiteOpen
+        , bench "memory/100 dispatches" $
+            perRunEnv setupMemoryDispatchFixture executeMemoryNotify
+        , bench "sqlite/100 dispatches" $
+            perRunEnvWithCleanup
+              setupSQLiteDispatchFixture
+              closeSQLiteDispatchFixture
+              executeSQLiteNotify
         ]
     ]
 
@@ -212,6 +267,26 @@ setupSQLiteFixture = do
   pure (SQLiteFixture store)
 
 
+setupEmptySQLiteFixture :: IO SQLiteFixture
+setupEmptySQLiteFixture = SQLiteFixture <$> openBenchmarkSQLite
+
+
+setupMemoryDispatchFixture :: IO MemoryDispatchFixture
+setupMemoryDispatchFixture = do
+  backend <- newMemoryStore
+  store <- benchmarkStore backend
+  _ <- executeTypedStoreCommand store Open
+  pure (MemoryDispatchFixture store)
+
+
+setupSQLiteDispatchFixture :: IO SQLiteDispatchFixture
+setupSQLiteDispatchFixture = do
+  backend <- openBenchmarkSQLite
+  store <- benchmarkStore backend
+  _ <- executeTypedStoreCommand store Open
+  pure (SQLiteDispatchFixture backend store)
+
+
 closeSQLiteFixture :: SQLiteFixture -> IO ()
 closeSQLiteFixture (SQLiteFixture store) = closeSQLiteStore store
 
@@ -259,6 +334,11 @@ closeSQLiteJobFixture (SQLiteJobFixture store _) = closeSQLiteStore store
 closeSQLiteReactorFixture :: SQLiteReactorFixture -> IO ()
 closeSQLiteReactorFixture (SQLiteReactorFixture store _) =
   closeSQLiteStore store
+
+
+closeSQLiteDispatchFixture :: SQLiteDispatchFixture -> IO ()
+closeSQLiteDispatchFixture (SQLiteDispatchFixture backend _) =
+  closeSQLiteStore backend
 
 
 consumeMemory :: MemoryFixture -> IO Word64
@@ -362,6 +442,71 @@ advanceReactors store = foldM advance 0
       case result of
         Right ReactorCommitted -> pure offset
         other -> panic (show other)
+
+
+executeMemoryOpen :: MemoryFixture -> IO Word64
+executeMemoryOpen (MemoryFixture backend) = executeStoreCommand backend Open
+
+
+executeSQLiteOpen :: SQLiteFixture -> IO Word64
+executeSQLiteOpen (SQLiteFixture backend) = executeStoreCommand backend Open
+
+
+executeMemoryNotify :: MemoryDispatchFixture -> IO Word64
+executeMemoryNotify (MemoryDispatchFixture store) = executeDispatches store
+
+
+executeSQLiteNotify :: SQLiteDispatchFixture -> IO Word64
+executeSQLiteNotify (SQLiteDispatchFixture _ store) = executeDispatches store
+
+
+executeStoreCommand
+  :: (EventStore backend, Show (BackendError backend))
+  => backend
+  -> AccountCommand
+  -> IO Word64
+executeStoreCommand backend command = do
+  store <- benchmarkStore backend
+  executeTypedStoreCommand store command
+
+
+executeDispatches
+  :: (EventStore backend, Show (BackendError backend))
+  => Store backend Account
+  -> IO Word64
+executeDispatches store = foldM execute 0 ([1 .. 100] :: [Word16])
+  where
+    execute _ _ = executeTypedStoreCommand store Notify
+
+
+executeTypedStoreCommand
+  :: (EventStore backend, Show (BackendError backend))
+  => Store backend Account
+  -> AccountCommand
+  -> IO Word64
+executeTypedStoreCommand store command = do
+  result <-
+    executeCommand
+      store
+      accountKey
+      command
+  pure case result of
+    Right (Account balance) -> balance
+    other -> panic (show other)
+
+
+benchmarkStore :: backend -> IO (Store backend Account)
+benchmarkStore backend = do
+  nextIdentifier <- newIORef (1 :: Word64)
+  pure
+    ( mkStore backend benchmarkLimits do
+        identifier <- atomicModifyIORef' nextIdentifier (\value -> (value + 1, value))
+        pure
+          ( fromMaybe
+              (panic "invalid benchmark job id")
+              (mkJobId ("benchmark-job-" <> show identifier))
+          )
+    )
 
 
 benchmarkBatch :: Word64 -> IO CommitBatch
