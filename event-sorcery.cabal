@@ -16,6 +16,8 @@ extra-source-files:
   adrs/*.md
   fourmolu.yaml
   README.md
+  stack.yaml
+  stack.yaml.lock
 
 common strict
   default-language:   GHC2024
@@ -25,11 +27,14 @@ common strict
     DerivingVia
     DuplicateRecordFields
     GADTs
+    LinearTypes
     MultiParamTypeClasses
+    MultilineStrings
     NoFieldSelectors
     NoImplicitPrelude
     OverloadedRecordDot
     OverloadedStrings
+    RankNTypes
     StandaloneDeriving
     TypeApplications
     TypeFamilies
@@ -46,14 +51,21 @@ library
   exposed-modules:
     EventSorcery
     EventSorcery.Aggregate
+    EventSorcery.Backend.Memory
+    EventSorcery.Backend.SQLite
+    EventSorcery.Store
     EventSorcery.Stream
 
+  other-modules:   EventSorcery.Store.Internal
   hs-source-dirs:  src
   build-depends:
-    , base        >=4.18  && <5
-    , bytestring  >=0.11  && <0.13
-    , protolude   >=0.3.4 && <0.4
-    , text        >=2.0   && <2.2
+    , base           >=4.18  && <5
+    , bytestring     >=0.11  && <0.13
+    , containers     >=0.6   && <0.9
+    , protolude      >=0.3.4 && <0.4
+    , sqlite-simple  >=0.4   && <0.5
+    , stm            >=2.5   && <2.6
+    , text           >=2.0   && <2.2
 
 test-suite event-sorcery-test
   import:         strict

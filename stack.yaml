@@ -1,0 +1,22 @@
+snapshot: nightly-2026-07-12
+compiler: ghc-9.14.1
+compiler-check: match-exact
+
+# GHC and Stack come from the Nix development shell.
+system-ghc: true
+install-ghc: false
+notify-if-nix-on-path: false
+
+packages:
+  - .
+
+extra-deps: []
+
+flags:
+  direct-sqlite:
+    systemlib: true
+
+ghc-options:
+  prettyprinter: -optP-Wno-expansion-to-defined
+
+rebuild-ghc-options: true
