@@ -6,8 +6,23 @@ The Haskell counterpart to
 [`event-sorcery`](https://github.com/dataclique/event-sorcery): pure,
 type-driven event-sourcing primitives with in-memory and SQLite persistence.
 
-The public API is currently under construction. Its architecture is recorded in
-the [architecture ADR](adrs/01-haskell-native-event-sourcing-architecture.md).
+Its architecture is recorded in the
+[accepted architecture ADR](adrs/01-haskell-native-event-sourcing-architecture.md).
+
+The library provides:
+
+- pure, fallible aggregate decisions with typed identifiers and job dispatches;
+- atomic multi-stream commits with optimistic concurrency in memory and SQLite;
+- Conduit-based projection and reactor runners with durable checkpoints;
+- schema-aware snapshots and derived-state reconciliation;
+- idempotent typed command delivery through durable delivery receipts;
+- fenced, retryable reactor outboxes with retained dead letters; and
+- event-sourced durable jobs with leases, reconciliation, retries, and explicit
+  terminal outcomes.
+
+The two backends share one conformance suite, so the same ordering, atomicity,
+replay, delivery, projection, reactor, schema, snapshot, and job contracts run
+against both implementations.
 
 ## Development
 
